@@ -60,11 +60,13 @@ structure(MessageBuffer, buffer="yes", inport="yes", outport="yes",
 external_type(Scalar, primitive="yes");
 
 structure(OutPort, external = "yes", primitive="yes") {
+    void print2();
     void enqueueDeferredMessages(Addr addr, Tick curTime, Tick delay);
     bool isDeferredMsgMapEmpty(Addr addr);
 }
 
 structure(InPort, external = "yes", primitive="yes") {
+  void print2();
   bool isReady(Tick current_time);
   Tick dequeue(Tick current_time);
   void recycle(Tick current_time, Tick recycle_latency);
@@ -125,6 +127,21 @@ structure (NetDest, external = "yes", non_obj="yes") {
   NetDest AND(NetDest);
 }
 
+structure(OwnerVec, external="yes", desc="...") {
+  void setOwner(int, MachineID);
+  void setOwner(WriteMask, MachineID);
+  void unsetOwner(WriteMask, MachineID);
+  void unsetOwner(WriteMask);
+  MachineID getOwner(int);
+  bool isOwner(MachineID, WriteMask);
+  bool isLastOwner(WriteMask);
+  void cpyVec(OwnerVec);
+  WriteMask getOwnerMask();
+  WriteMask getOwnerMask(MachineID, WriteMask);
+  NetDest getOwnerNetDest();
+  int getSize(); // Don't think I need this in the slicc, but I'll include it
+}
+
 structure (Sequencer, external = "yes") {
   void readCallback(Addr, DataBlock);
   void readCallback(Addr, DataBlock, bool);
@@ -152,6 +169,87 @@ structure (Sequencer, external = "yes") {
 structure (HTMSequencer, interface="Sequencer", external = "yes") {
   // hardware transactional memory
   void htmCallback(Addr, HtmCallbackMode, HtmFailedInCacheReason);
+}
+
+structure (SpandexSequencer, external = "yes") {
+  void readCallback(Addr, DataBlock);
+  void readCallback(Addr, DataBlock, bool);
+  void readCallback(Addr, DataBlock, bool, MachineType);
+  void readCallback(Addr, DataBlock, bool, MachineType,
+                    Cycles, Cycles, Cycles);
+
+  void writeCallback(Addr, DataBlock);
+  void writeCallback(Addr, DataBlock, bool);
+  void writeCallback(Addr, DataBlock, bool, MachineType);
+  void writeCallback(Addr, DataBlock, bool, MachineType,
+                     Cycles, Cycles, Cycles);
+
+  void checkCoherence(Addr);
+  void evictionCallback(Addr);
+  void recordRequestType(SequencerRequestType);
+  bool checkResourceAvailable(CacheResourceType, Addr);
+  void invalidateSC(Addr);
+}
+
+structure (GPUCoalescer, external = "yes") {
+  void readCallback(Addr, DataBlock);
+  void readCallback(Addr, MachineType, DataBlock);
+  void readCallback(Addr, MachineType, DataBlock,
+                    Cycles, Cycles, Cycles);
+  void readCallback(Addr, MachineType, DataBlock,
+                    Cycles, Cycles, Cycles, bool);
+  void writeCallback(Addr, DataBlock);
+  void writeCallback(Addr, MachineType, DataBlock);
+  void writeCallback(Addr, MachineType, DataBlock,
+                     Cycles, Cycles, Cycles);
+  void writeCallback(Addr, MachineType, DataBlock,
+                     Cycles, Cycles, Cycles, bool);
+  void writeCompleteCallback(Addr, uint64_t, MachineType);
+  void atomicCallback(Addr, MachineType, DataBlock);
+  void checkCoherence(Addr);
+  void evictionCallback(Addr);
+  void recordCPReadCallBack(MachineID, MachineID);
+  void recordCPWriteCallBack(MachineID, MachineID);
+}
+
+structure (VIPERCoalescer, external = "yes") {
+  void readCallback(Addr, DataBlock);
+  void readCallback(Addr, MachineType, DataBlock);
+  void readCallback(Addr, MachineType, DataBlock,
+                    Cycles, Cycles, Cycles);
+  void readCallback(Addr, MachineType, DataBlock,
+                    Cycles, Cycles, Cycles, bool);
+  void writeCallback(Addr, DataBlock);
+  void writeCallback(Addr, MachineType, DataBlock);
+  void writeCallback(Addr, MachineType, DataBlock,
+                     Cycles, Cycles, Cycles);
+  void writeCallback(Addr, MachineType, DataBlock,
+                     Cycles, Cycles, Cycles, bool);
+  void atomicCallback(Addr, MachineType, DataBlock);
+  void invTCPCallback(Addr);
+  void writeCompleteCallback(Addr, uint64_t, MachineType);
+  void checkCoherence(Addr);
+  void evictionCallback(Addr);
+}
+
+structure (DeNovoCoalescer, external = "yes") {
+  void readCallback(Addr, DataBlock);
+  void readCallback(Addr, MachineType, DataBlock);
+  void readCallback(Addr, MachineType, DataBlock,
+                    Cycles, Cycles, Cycles);
+  void readCallback(Addr, MachineType, DataBlock,
+                    Cycles, Cycles, Cycles, bool);
+  void writeCallback(Addr, DataBlock);
+  void writeCallback(Addr, MachineType, DataBlock);
+  void writeCallback(Addr, MachineType, DataBlock,
+                     Cycles, Cycles, Cycles);
+  void writeCallback(Addr, MachineType, DataBlock,
+                     Cycles, Cycles, Cycles, bool);
+  void atomicCallback(Addr, MachineType, DataBlock);
+  void invTCPCallback(Addr);
+  void writeCompleteCallback(Addr, uint64_t, MachineType);
+  void checkCoherence(Addr);
+  void evictionCallback(Addr);
 }
 
 structure(RubyRequest, desc="...", interface="Message", external="yes") {
@@ -217,6 +315,7 @@ structure (CacheMemory, external = "yes") {
   void profileDemandMiss();
   void profilePrefetchHit();
   void profilePrefetchMiss();
+  int getWordIndex(Addr);
 }
 
 structure (WireBuffer, inport="yes", outport="yes", external = "yes") {

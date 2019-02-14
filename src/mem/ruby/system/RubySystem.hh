@@ -36,6 +36,7 @@
 #define __MEM_RUBY_SYSTEM_RUBYSYSTEM_HH__
 
 #include <unordered_map>
+#define BYTES_PER_WORD 4
 
 #include "base/callback.hh"
 #include "base/output.hh"

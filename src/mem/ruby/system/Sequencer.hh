@@ -65,10 +65,18 @@ struct SequencerRequest
     RubyRequestType m_type;
     RubyRequestType m_second_type;
     Cycles issue_time;
+    WriteMask pendingReqMask;
     SequencerRequest(PacketPtr _pkt, RubyRequestType _m_type,
                      RubyRequestType _m_second_type, Cycles _issue_time)
                 : pkt(_pkt), m_type(_m_type), m_second_type(_m_second_type),
-                  issue_time(_issue_time)
+                  issue_time(_issue_time), pendingReqMask()
+    {}
+
+    SequencerRequest(PacketPtr _pkt, RubyRequestType _m_type,
+                     RubyRequestType _m_second_type, Cycles _issue_time,
+                     std::vector<bool> _reqMask)
+                : pkt(_pkt), m_type(_m_type), m_second_type(_m_second_type),
+                  issue_time(_issue_time), pendingReqMask(_reqMask.size() ,_reqMask)
     {}
 
     bool functionalWrite(Packet *func_pkt) const
@@ -191,7 +199,7 @@ class Sequencer : public RubyPort
     statistics::Counter getIncompleteTimes(const MachineType t) const
     { return m_IncompleteTimes[t]; }
 
-  private:
+  protected:
     void issueRequest(PacketPtr pkt, RubyRequestType type);
 
     void hitCallback(SequencerRequest* srequest, DataBlock& data,

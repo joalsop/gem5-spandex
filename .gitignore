@@ -28,6 +28,14 @@ m5out
 /system/arm/bootloader/arm64/boot.arm64
 /system/arm/bootloader/arm64/boot_emm.arm64
 /system/arm/bootloader/arm64/boot_v2.arm64
+/system/arm/simple_bootloader/*.o
+/system/arm/simple_bootloader/boot.arm
+/system/arm/simple_bootloader/boot_emm.arm
+/system/arm/aarch64_bootloader/boot_emm.arm64
 configs/example/memcheck.cfg
 configs/dram/lowp_sweep.cfg
 .pyenv
+.mypy_cache/
+*.exe
+/apps/output
+/apps/compile.sh

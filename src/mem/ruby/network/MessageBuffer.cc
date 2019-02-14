@@ -181,6 +181,17 @@ MessageBuffer::peek() const
     return msg_ptr;
 }
 
+Message*
+MessageBuffer::peek_dangerous()
+{
+    DPRINTF(RubyQueue, "Peeking dangerously at head of queue.\n");
+    Message* msg_ptr = m_prio_heap.front().get();
+    assert(msg_ptr);
+
+    DPRINTF(RubyQueue, "Message: %s\n", (*msg_ptr));
+    return msg_ptr;
+}
+
 // FIXME - move me somewhere else
 Tick
 random_time()
@@ -435,6 +446,33 @@ MessageBuffer::stallMessage(Addr addr, Tick current_time)
     m_stall_count++;
 }
 
+void
+MessageBuffer::stallMessagePartial(Addr addr, Tick current_time,
+        WriteMask action_mask)
+{
+    DPRINTF(RubyQueue, "Stalling due to %#x\n", addr);
+    assert(isReady(current_time));
+    assert(getOffset(addr) == 0);
+    MsgPtr message = m_prio_heap.front();
+
+    MsgPtr msg_clone = message->clone();
+    msg_clone->m_bitMask.clear();
+    msg_clone->m_bitMask.setMask(action_mask);
+
+    if (DTRACE(RubyQueue)) {
+        msg_clone->print(std::cout);
+    }
+
+    //
+    // Note: no event is scheduled to analyze the map at a later time.
+    // Instead the controller is responsible to call reanalyzeMessages when
+    // these addresses change state.
+    //
+    (m_stall_msg_map[addr]).push_back(msg_clone);
+    m_stall_map_size++;
+    m_stall_count++;
+}
+
 bool
 MessageBuffer::hasStalledMsg(Addr addr) const
 {
@@ -482,6 +520,23 @@ MessageBuffer::print(std::ostream& out) const
     std::vector<MsgPtr> copy(m_prio_heap);
     std::sort_heap(copy.begin(), copy.end(), std::greater<MsgPtr>());
     ccprintf(out, "%s] %s", copy, name());
+}
+
+void
+MessageBuffer::print2() const {
+    std::cout << curTick() <<": " <<"[MessageBuffer " << name() << ": ";
+    if (m_consumer != NULL) {
+        std::cout << " consumer-yes ";
+    }
+    vector<MsgPtr> copy(m_prio_heap);
+    sort_heap(copy.begin(), copy.end(), greater<MsgPtr>());
+    std::cout << "\n";
+    for (MsgPtr msg : copy) {
+        std::cout << "    ";
+        msg->print(std::cout);
+        std::cout << " " << msg->getLastEnqueueTime() << ",\n";
+    }
+    std::cout << "]" << std::endl;
 }
 
 bool

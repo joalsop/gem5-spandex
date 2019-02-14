@@ -124,6 +124,7 @@ class CoalescedRequest
     Cycles getIssueTime() const { return issueTime; }
     RubyRequestType getRubyType() const { return rubyType; }
     std::vector<PacketPtr>& getPackets() { return pkts; }
+    WriteMask pendingReqMask;
 
   private:
     uint64_t seqNum;
@@ -409,7 +410,7 @@ class GPUCoalescer : public RubyPort
     // previous instruction and the max number of outstanding requests has
     // not be reached, a new coalesced request is created and added to the
     // "target" list of the coalescedTable.
-    bool coalescePacket(PacketPtr pkt);
+    virtual bool coalescePacket(PacketPtr pkt);
 
     EventFunctionWrapper issueEvent;
 

@@ -121,6 +121,7 @@ class Message
     int getVnet() const { return vnet; }
     void setVnet(int net) { vnet = net; }
 
+    WriteMask m_bitMask;
   private:
     Tick m_time;
     Tick m_LastEnqueueTime; // my last enqueue time
@@ -130,6 +131,7 @@ class Message
     // Variables for required network traversal
     int incoming_link;
     int vnet;
+
 };
 
 inline bool

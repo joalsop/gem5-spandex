@@ -40,6 +40,7 @@
 
 from slicc.ast.ExprAST import ExprAST
 from slicc.symbols import Func, Type
+import random
 
 class FuncCallExprAST(ExprAST):
     def __init__(self, slicc, proc_name, exprs):
@@ -106,10 +107,38 @@ class FuncCallExprAST(ExprAST):
 
             return self.symtab.find("void", Type)
 
+        if self.proc_name == 'DTRACE':
+            code('DTRACE($0)', "%s" % (self.exprs[0].name))
+            return self.symtab.find("bool", Type)
+
         # hack for adding comments to profileTransition
         if self.proc_name == "APPEND_TRANSITION_COMMENT":
             # FIXME - check for number of parameters
             code("APPEND_TRANSITION_COMMENT($0)", self.exprs[0].inline())
+            return self.symtab.find("void", Type)
+
+        if self.proc_name == "triggerLines":
+            if len(self.exprs) % 5 != 0:
+                self.error("Wrong number of arguments passed to triggerLines (got {0})".format(len(self.exprs)))
+            n_lines = len(self.exprs) // 5
+            args = [expr.inline() for expr in self.exprs]
+            code('if (\n')
+            for i in range(n_lines):
+                code('    doTransitionLineChecker(${{args[i*5+0]}}, ${{args[i*5+2]}}, ${{args[i*5+3]}}, ${{args[i*5+1]}}, ${{args[i*5+4]}}) == TransitionResult_Valid &&\n')
+            code('true) {\n')
+            for i in range(n_lines):
+                code('    doTransitionLine(${{args[i*5+0]}}, ${{args[i*5+2]}}, ${{args[i*5+3]}}, ${{args[i*5+1]}}, ${{args[i*5+4]}}, true);\n')
+            code('''
+    // prechecked, so guaranteed to succeed
+    // Normally add 1, for transition line we add 1 for every word being transitioned
+    counter += 1;
+    continue; // Check the first port again
+} else {
+    DPRINTF(RubySlicc, "TransitionLine's preconditions not met; stalling\\n");
+    scheduleEvent(Cycles(1));
+    // Cannot do anything with this transition, go to check next doable transition (most likely of next port)
+}
+''')
             return self.symtab.find("void", Type)
 
         func_name_args = self.proc_name
@@ -141,35 +170,39 @@ class FuncCallExprAST(ExprAST):
         # transition should be executed in one cycle for a given
         # port. So as most of current protocols.
 
+        # TODO: make this guaranteed to be unique
+        result = "result_%d" % random.randint(0, 100000)
+
         if self.proc_name == "trigger":
             code('''
 {
 ''')
             if machine.TBEType != None and machine.EntryType != None:
                 code('''
-    TransitionResult result = doTransition(${{cvec[0]}}, ${{cvec[2]}}, ${{cvec[3]}}, ${{cvec[1]}});
+    TransitionResult $result = doTransition(${{cvec[0]}}, ${{cvec[2]}}, ${{cvec[3]}}, ${{cvec[1]}});
 ''')
             elif machine.TBEType != None:
                 code('''
-    TransitionResult result = doTransition(${{cvec[0]}}, ${{cvec[2]}}, ${{cvec[1]}});
+    TransitionResult $result = doTransition(${{cvec[0]}}, ${{cvec[2]}}, ${{cvec[1]}});
 ''')
             elif machine.EntryType != None:
                 code('''
-    TransitionResult result = doTransition(${{cvec[0]}}, ${{cvec[2]}}, ${{cvec[1]}});
+    TransitionResult $result = doTransition(${{cvec[0]}}, ${{cvec[2]}}, ${{cvec[1]}});
 ''')
             else:
                 code('''
-    TransitionResult result = doTransition(${{cvec[0]}}, ${{cvec[1]}});
+    TransitionResult $result = doTransition(${{cvec[0]}}, ${{cvec[1]}});
 ''')
 
             assert('in_port' in kwargs)
             in_port = kwargs['in_port']
 
             code('''
-    if (result == TransitionResult_Valid) {
+    if ($result == TransitionResult_Valid) {
         counter++;
         continue; // Check the first port again
-    } else if (result == TransitionResult_ResourceStall) {
+    } else if (result == TransitionResult_ResourceStall ||
+               result == TransitionResult_ProtocolStall) {
 ''')
             if 'rsc_stall_handler' in in_port.pairs:
                 stall_func_name = in_port.pairs['rsc_stall_handler']
@@ -210,6 +243,25 @@ class FuncCallExprAST(ExprAST):
     }
 
 }
+''')
+
+        # Paritally taken from trigger function above
+        # Prereq needing TBEType and EntryType (i.e. case 1 from above)
+        elif self.proc_name == "triggerLine":
+            code('''
+    TransitionResult $result = doTransitionLine(${{cvec[0]}}, ${{cvec[2]}}, ${{cvec[3]}}, ${{cvec[1]}}, ${{cvec[4]}});
+    if ($result == TransitionResult_Valid) {
+        // Normally add 1, for transition line we add 1 for every word being transitioned
+        counter += 1;
+        continue; // Check the first port again
+    }
+
+    if ($result == TransitionResult_ResourceStall ||
+        $result == TransitionResult_ProtocolStall) {
+        DPRINTF(RubySlicc, "TransitionResult_Stall\\n");
+        scheduleEvent(Cycles(1));
+        // Cannot do anything with this transition, go to check next doable transition (most likely of next port)
+    }
 ''')
         elif self.proc_name == "error":
             code("$0", self.exprs[0].embedError(cvec[0]))

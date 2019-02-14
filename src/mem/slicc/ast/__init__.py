@@ -73,6 +73,7 @@ from slicc.ast.PeekStatementAST import *
 from slicc.ast.ReturnStatementAST import *
 from slicc.ast.StallAndWaitStatementAST import *
 from slicc.ast.WakeupPortStatementAST import *
+from slicc.ast.StallAndWaitPartialStatementAST import *
 from slicc.ast.StateDeclAST import *
 from slicc.ast.StatementAST import *
 from slicc.ast.StatementListAST import *

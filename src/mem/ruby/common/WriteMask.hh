@@ -47,6 +47,7 @@
 #include <vector>
 
 #include "base/amo.hh"
+#include "base/types.hh"
 #include "mem/ruby/common/DataBlock.hh"
 #include "mem/ruby/common/TypeDefines.hh"
 
@@ -55,6 +56,7 @@ namespace gem5
 
 namespace ruby
 {
+class AtomicOpFunctor;
 
 class WriteMask
 {
@@ -63,17 +65,12 @@ class WriteMask
 
     WriteMask();
 
-    WriteMask(int size)
-      : mSize(size), mMask(size, false), mAtomic(false)
-    {}
+    WriteMask(int size);
 
-    WriteMask(int size, std::vector<bool> & mask)
-      : mSize(size), mMask(mask), mAtomic(false)
-    {}
+    WriteMask(int size, std::vector<bool> & mask);
 
-    WriteMask(int size, std::vector<bool> &mask, AtomicOpVector atomicOp)
-      : mSize(size), mMask(mask), mAtomic(true), mAtomicOp(atomicOp)
-    {}
+    WriteMask(int size, std::vector<bool> &mask,
+              std::vector<std::pair<int, AtomicOpFunctor*> > atomicOp);
 
     ~WriteMask()
     {}
@@ -99,6 +96,36 @@ class WriteMask
             mMask[offset + i] = val;
         }
     }
+
+    void
+    setMask(WriteMask const& readMask) {
+        assert(mSize == readMask.getSize());
+        for (int i = 0; i < mSize; i++) {
+            if (readMask.getMask(i,1)) {
+                mMask[i] = true;
+            }
+        }
+    }
+
+    void
+    unsetMask(int offset, int len)
+    {
+        assert(mSize >= (offset + len));
+        for (int i = 0; i < len; i++) {
+            mMask[offset + i] = false;
+        }
+    }
+
+    void
+    unsetMask(WriteMask const& readMask) {
+        assert(mSize == readMask.getSize());
+        for (int i = 0; i < mSize; i++) {
+            if (readMask.getMask(i,1)) {
+                mMask[i] = false;
+            }
+        }
+    }
+
     void
     fillMask()
     {
@@ -166,32 +193,10 @@ class WriteMask
     }
 
     void
-    andMask(const WriteMask & writeMask)
-    {
-        assert(mSize == writeMask.mSize);
-        for (int i = 0; i < mSize; i++) {
-            mMask[i] = (mMask.at(i)) & (writeMask.mMask.at(i));
-        }
-
-        if (writeMask.mAtomic) {
-            mAtomic = true;
-            mAtomicOp = writeMask.mAtomicOp;
-        }
-    }
+    orMask(const WriteMask & writeMask);
 
     void
-    orMask(const WriteMask & writeMask)
-    {
-        assert(mSize == writeMask.mSize);
-        for (int i = 0; i < mSize; i++) {
-            mMask[i] = (mMask.at(i)) | (writeMask.mMask.at(i));
-        }
-
-        if (writeMask.mAtomic) {
-            mAtomic = true;
-            mAtomicOp = writeMask.mAtomicOp;
-        }
-    }
+    andMask(const WriteMask & writeMask);
 
     void
     setInvertedMask(const WriteMask & writeMask)
@@ -223,23 +228,30 @@ class WriteMask
     void print(std::ostream& out) const;
 
     void
-    performAtomic(uint8_t * p) const
+    performAtomic(uint8_t * p) const;
+
+    void
+    performAtomic(DataBlock & blk) const;
+
+    int getSize() const
     {
-        for (int i = 0; i < mAtomicOp.size(); i++) {
-            int offset = mAtomicOp[i].first;
-            AtomicOpFunctor *fnctr = mAtomicOp[i].second;
-            (*fnctr)(&p[offset]);
+        return mSize;
+    }
+
+    int getCount() const;
+
+    void cpyMask(const WriteMask & src)
+    {
+        assert(mSize == src.mSize);
+        for (int i = 0; i < mSize; i++) {
+            mMask[i] = src.mMask.at(i);
         }
     }
 
-    void
-    performAtomic(DataBlock & blk) const
+    void invertMask()
     {
-        for (int i = 0; i < mAtomicOp.size(); i++) {
-            int offset = mAtomicOp[i].first;
-            uint8_t *p = blk.getDataMod(offset);
-            AtomicOpFunctor *fnctr = mAtomicOp[i].second;
-            (*fnctr)(p);
+        for (int i = 0; i < mSize; i++) {
+            mMask[i] = !mMask[i];
         }
     }
 
@@ -255,6 +267,13 @@ class WriteMask
         mAtomic = true;
         mAtomicOp = std::move(atomicOps);
     }
+    bool isFirstValid(Addr address) const;
+
+    bool isLastValid(Addr address) const;
+
+    // Should be static, but that can't be used in slicc
+    int getWordOffset(Addr physAddr) const;
+    int getByteOffset(Addr physAddr) const;
 
   private:
     int mSize;

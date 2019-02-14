@@ -117,8 +117,10 @@ class SLICC(Grammar):
         'enumeration' : 'ENUM',
         'state_declaration' : 'STATE_DECL',
         'peek' : 'PEEK',
+        'peek_dangerous' : 'PEEK_DANGEROUS',
         'stall_and_wait' : 'STALL_AND_WAIT',
         'wakeup_port' : 'WAKEUP_PORT',
+        'stall_and_wait_partial' : 'STALL_AND_WAIT_PARTIAL',
         'enqueue' : 'ENQUEUE',
         'check_allocate' : 'CHECK_ALLOCATE',
         'check_next_cycle' : 'CHECK_NEXT_CYCLE',
@@ -621,9 +623,17 @@ class SLICC(Grammar):
         "statement : WAKEUP_PORT '(' var ',' var ')' SEMI"
         p[0] = ast.WakeupPortStatementAST(self, p[3], p[5])
 
+    def p_statement__stall_and_wait_partial(self, p):
+        "statement : STALL_AND_WAIT_PARTIAL '(' var ',' var ',' var ')' SEMI"
+        p[0] = ast.StallAndWaitPartialStatementAST(self, p[3], p[5], p[7])
+
     def p_statement__peek(self, p):
         "statement : PEEK '(' var ',' type pairs ')' statements"
         p[0] = ast.PeekStatementAST(self, p[3], p[5], p[6], p[8], "peek")
+
+    def p_statement__peek_dangerous(self, p):
+        "statement : PEEK_DANGEROUS '(' var ',' type pairs ')' statements"
+        p[0] = ast.PeekStatementAST(self, p[3], p[5], p[6], p[8], "peek_dangerous")
 
     def p_statement__check_allocate(self, p):
         "statement : CHECK_ALLOCATE '(' var ')' SEMI"

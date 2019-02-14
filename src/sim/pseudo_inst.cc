@@ -40,8 +40,6 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "sim/pseudo_inst.hh"
-
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -51,9 +49,20 @@
 #include <string>
 #include <vector>
 
+#include <gem5/asm/generic/m5ops.h>
+#include <gem5/denovo_region_api.h>
+
+#include "arch/kernel_stats.hh"
+#include "arch/pseudo_inst.hh"
+#include "arch/utility.hh"
+#include "arch/vtophys.hh"
 #include "base/debug.hh"
 #include "base/output.hh"
+#include "base/types.hh"
+#include "config/the_isa.hh"
 #include "cpu/base.hh"
+#include "cpu/quiesce_event.hh"
+#include "cpu/simple/timing.hh"
 #include "cpu/thread_context.hh"
 #include "debug/Loader.hh"
 #include "debug/Quiesce.hh"
@@ -62,14 +71,18 @@
 #include "mem/se_translating_port_proxy.hh"
 #include "mem/translating_port_proxy.hh"
 #include "params/BaseCPU.hh"
+#include "sim/denovo_region_table.hh"
 #include "sim/full_system.hh"
 #include "sim/process.hh"
+#include "sim/pseudo_inst.hh"
 #include "sim/serialize.hh"
 #include "sim/sim_events.hh"
 #include "sim/sim_exit.hh"
 #include "sim/stat_control.hh"
 #include "sim/stats.hh"
 #include "sim/system.hh"
+#include "sim/vptr.hh"
+#include "system.hh"
 
 namespace gem5
 {
@@ -593,6 +606,47 @@ workend(ThreadContext *tc, uint64_t workid, uint64_t threadid)
             exitSimLoop("work items exit count reached");
         }
     }
+}
+
+void denovo_region_set(ThreadContext *tc, uint64_t rdi, uint64_t rsi) {
+    DenovoRegionTable& table = DenovoRegionTable::get_instance();
+
+    denovo_region_args args;
+    ((uint64_t*)&args)[0] = rdi;
+    ((uint64_t*)&args)[1] = rsi;
+
+    if (args.processor == THIS_CONTEXT) {
+        args.processor = tc->contextId();
+    }
+
+    // size == 0 means setting global properties
+    if (args.size == 0) {
+        if (args.read_policy == MEM_SIM_ON || args.read_policy == MEM_SIM_OFF) {
+            if (args.processor == ALL_CONTEXTS) {
+                table.set_mem_sim_all(args.read_policy == MEM_SIM_ON);
+            } else {
+                table.set_mem_sim_thread(args.read_policy == MEM_SIM_ON, args.processor);
+            }
+        }
+    } else {
+        table.put_region(
+            reinterpret_cast<Addr>(args.start), args.size, args.processor,
+            args.read_policy, args.write_policy, args.rmw_policy);
+    }
+
+    /*
+    System* system;
+    assert(system = dynamic_cast<System*>(tc->getSystemPtr()));
+
+    DPRINTF(PseudoInst,
+                    "system->threadContexts.size() = %d\n",
+                    system->threadContexts.size());
+
+    for (auto& tc : system->threadContexts) {
+            TimingSimpleCPU* cpu;
+            assert(cpu = dynamic_cast<TimingSimpleCPU*>(tc->getCpuPtr()));
+    }
+    */
 }
 
 } // namespace pseudo_inst

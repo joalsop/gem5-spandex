@@ -268,10 +268,10 @@ CacheMemory::cacheAvail(Addr address) const
 AbstractCacheEntry*
 CacheMemory::allocate(Addr address, AbstractCacheEntry *entry)
 {
+    DPRINTF(RubyCache, "address: %#x\n", address);
     assert(address == makeLineAddress(address));
     assert(!isTagPresent(address));
     assert(cacheAvail(address));
-    DPRINTF(RubyCache, "address: %#x\n", address);
 
     // Find the first open slot
     int64_t cacheSet = addressToCacheSet(address);

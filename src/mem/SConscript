@@ -116,6 +116,7 @@ CompoundFlag('XBar', ['BaseXBar', 'CoherentXBar', 'NoncoherentXBar',
 
 DebugFlag('Bridge')
 DebugFlag('CommMonitor')
+DebugFlag('DenovoRegion2')
 DebugFlag('DRAM')
 DebugFlag('DRAMPower')
 DebugFlag('DRAMState')

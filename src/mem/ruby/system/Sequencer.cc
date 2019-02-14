@@ -140,7 +140,6 @@ Sequencer::Sequencer(const Params &p)
     }
 
 }
-
 Sequencer::~Sequencer()
 {
 }

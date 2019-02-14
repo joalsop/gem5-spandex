@@ -31,6 +31,15 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "base/logging.hh"
+#include "base/str.hh"
+#include "config/the_isa.hh"
+#include "debug/DenovoRegion2.hh"
+
+#if THE_ISA == X86_ISA
+#include "arch/x86/insts/microldstop.hh"
+
+#endif // X86_ISA
 #include "mem/ruby/system/GPUCoalescer.hh"
 
 #include "base/compiler.hh"
@@ -547,7 +556,7 @@ GPUCoalescer::hitCallback(CoalescedRequest* crequest,
 
     RubyRequestType type = crequest->getRubyType();
 
-    DPRINTF(GPUCoalescer, "Got hitCallback for 0x%X\n", request_line_address);
+    DPRINTF(GPUCoalescer, "Got hitCallback for 0x%x\n", request_line_address);
 
     recordMissLatency(crequest, mach,
                       initialRequestTime,

@@ -61,6 +61,7 @@
 #include "mem/ruby/common/Address.hh"
 #include "mem/ruby/common/Consumer.hh"
 #include "mem/ruby/network/dummy_port.hh"
+#include "mem/ruby/common/WriteMask.hh"
 #include "mem/ruby/slicc_interface/Message.hh"
 #include "params/MessageBuffer.hh"
 #include "sim/sim_object.hh"
@@ -80,6 +81,9 @@ class MessageBuffer : public SimObject
     void reanalyzeMessages(Addr addr, Tick current_time);
     void reanalyzeAllMessages(Tick current_time);
     void stallMessage(Addr addr, Tick current_time);
+    void stallMessagePartial(Addr addr, Tick current_time,
+            WriteMask action_mask);
+
     // return true if the stall map has a message of this address
     bool hasStalledMsg(Addr addr) const;
 
@@ -118,6 +122,10 @@ class MessageBuffer : public SimObject
     //! message queue.  The function assumes that the queue is nonempty.
     const Message* peek() const;
 
+    // Some of our code requires altering the message at the head of the
+    // queue, this requires a non const returned message ptr
+    Message* peek_dangerous();
+
     const MsgPtr &peekMsgPtr() const { return m_prio_heap.front(); }
 
     void enqueue(MsgPtr message, Tick curTime, Tick delta);
@@ -150,6 +158,7 @@ class MessageBuffer : public SimObject
 
     void clear();
     void print(std::ostream& out) const;
+    void print2() const;
     void clearStats() { m_not_avail_count = 0; m_msg_counter = 0; }
 
     void setIncomingLink(int link_id) { m_input_link_id = link_id; }

@@ -1,0 +1,207 @@
+/* CoherenceRequestType */
+enumeration(CoherenceRequestType, desc="...") {
+    ReqO,           desc="Get word ownership";
+    ReqV,           desc="Get word data";
+    ReqS,           desc="Get word data in shared state";
+    ReqOData,       desc="Get word ownership + data";
+    ReqWB_L2,       desc="Request writeback to L2";
+    ReqWB_Mem,      desc="Request writeback to Mem";
+    ReqWT,          desc="Request writethrough";
+    ReqWTData,      desc="Request writethrough + data";
+    ReqRvkO,        desc="Revoke ownership";
+    Inv,           desc="Request invalidation";
+
+    FwdReqO,        desc="Get word ownership from another L1";
+    FwdReqV,        desc="Get word data from another L1";
+    FwdReqOdata,    desc="Get word ownership + data from another L1";
+    FwdReqS,        desc="Get word data from another L1 (shared)";
+}
+
+/* CoherenceResponseType */
+enumeration(CoherenceResponseType, desc="...") {
+    RspO,           desc="Send word ownership";
+    RspV,           desc="Send word data";
+    RspS,           desc="Send shared data";
+    RspOdata,       desc="Send word ownership + data";
+    RspWB,         desc="Ack writeback to L2";
+    RspWB_Mem,      desc="Ack writeback to Mem";
+    RspWT,          desc="Ack writethough";
+    RspRvkO,        desc="Ack revoke ownership";
+    
+    Ack,            desc="Ack invalidate req";
+    AckInvS,        desc="Ack invalidate shared req";
+
+    /*TODO not sure I need these specific Rsps*/
+    RspFwdO,        desc="Send word ownership from another L1";
+    RspFwdV,        desc="Send word data from another L1";
+    RspFwdOdata,    desc="Send word ownership + data from another L1";
+
+    NackReqV,        desc="Nack for word data request (L1 to L1)";
+    NackReqOdata,    desc="Nack for word ownership + data (L2 to L1)";
+    /* Question: Do we need more Ncks? */
+}
+
+/* RequestMsg */
+structure(RequestMsg, desc="...", interface="Message") {
+  Addr LineAddress,             desc="Line address for this request";
+  CoherenceRequestType Type,    desc="Type of request";
+  MachineID Requestor,          desc="Requester component";
+  DataBlock DataBlk,            desc="Data for the cache line (write-back)";
+  NetDest Destination,          desc="Receiver component, includes MachineType and num";
+  bool Dirty, default="false",  desc="Dirty bit"; // for evicting owned line
+  WriteMask bitMask,   desc="Request mask for words in the cache", abstract="true";
+  MessageSizeType MessageSize,  desc="size category of the message";
+  OwnerVec OwnerInfo,           desc="Ownship info for this line";
+
+  Addr LogicalAddress,       desc="Virtual Address for this request";
+
+  // for ptop
+  Cycles ReqIssue,                desc="When this request message was issued.";
+  Cycles ReqRedir,                desc="When this request was redirected.";
+
+  //for GPU
+  int ResponseCount,            desc="Number of responses triggered at L2.";
+
+  bool functionalRead(Packet *pkt) {
+    return false;
+  }
+
+  bool functionalWrite(Packet *pkt) {
+    return false;
+  }
+}
+
+/* ResponseMsg */
+structure(ResponseMsg, desc="...", interface="Message") {
+  Addr LineAddress,             desc="Line address for this request";
+  CoherenceResponseType Type,   desc="Type of response";
+  MachineID Sender,             desc="Sender component";
+  DataBlock DataBlk,            desc="Data for the cache line";
+  NetDest Destination,          desc="Destination component";
+  bool Dirty, default="false",  desc="Dirty bit";
+  MessageSizeType MessageSize,  desc="size category of the message";
+  //WriteMask States,             desc="state information of the words in the line";
+  //WriteMask outstandingStates,  desc="state information of the words in the line with outstanding registration requests";
+  WriteMask bitMask,   desc="response mask for words in the cache", abstact="true";
+  OwnerVec OwnerInfo,           desc="Ownship info for this line"; // Not sure if this is needed in responses
+
+  // for ptop
+  bool threehop, default="false",desc="Whether this is a 3-hop response.";
+  Cycles ReqIssue,                desc="When the request message was issued.";
+  Cycles ReqRedir,                desc="When the request was redirected.";
+  Cycles RspIssue,                desc="When this response message was issued.";
+
+  //for GPU
+  int ResponseCount,            desc="Number of responses triggered at L2.";
+
+  bool functionalRead(Packet *pkt) {
+    return false;
+  }
+
+  bool functionalWrite(Packet *pkt) {
+    return false;
+  }
+}
+
+/* AMD DMA ADD START */
+enumeration(DMARequestType, desc="...", default="DMARequestType_NULL") {
+  READ,          desc="Memory Read";
+  WRITE,         desc="Memory Write";
+  NULL,          desc="Invalid";
+}
+
+enumeration(DMAResponseType, desc="...", default="DMAResponseType_NULL") {
+  DATA,          desc="DATA read";
+  ACK,           desc="ACK write";
+  NULL,          desc="Invalid";
+}
+
+structure(DMARequestMsg, desc="...", interface="Message") {
+  DMARequestType Type,       desc="Request type (read/write)";
+  Addr PhysicalAddress,   desc="Physical address for this request";
+  Addr LineAddress,       desc="Line address for this request";
+  MachineID Requestor,            desc="Node who initiated the request";
+  NetDest Destination,       desc="Destination";
+  DataBlock DataBlk,         desc="DataBlk attached to this request";
+  int Len,                   desc="The length of the request";
+  MessageSizeType MessageSize, desc="size category of the message";
+
+  bool functionalRead(Packet *pkt) {
+    return testAndRead(LineAddress, DataBlk, pkt);
+  }
+
+  bool functionalWrite(Packet *pkt) {
+    return testAndWrite(LineAddress, DataBlk, pkt);
+  }
+}
+
+structure(DMAResponseMsg, desc="...", interface="Message") {
+  DMAResponseType Type,      desc="Response type (DATA/ACK)";
+  Addr PhysicalAddress,   desc="Physical address for this request";
+  Addr LineAddress,       desc="Line address for this request";
+  NetDest Destination,       desc="Destination";
+  DataBlock DataBlk,         desc="DataBlk attached to this request";
+  MessageSizeType MessageSize, desc="size category of the message";
+
+  bool functionalRead(Packet *pkt) {
+    return testAndRead(LineAddress, DataBlk, pkt);
+  }
+
+  bool functionalWrite(Packet *pkt) {
+    return testAndWrite(LineAddress, DataBlk, pkt);
+  }
+}
+/* AMD DMA ADD END */
+
+////We gotta figure out what these generics are used for
+//GenericRequestType convertToGenericType(CoherenceRequestType type) {
+////      // ReqRiD,           desc="Get word";
+////      // ReqOiD,           desc="Get ownership";
+////      // ReqRiDj,          desc="Get word (from another L1)";
+////      // ReqRiDM,          desc="Get word (from memory)";
+////      // ReqOiDj,          desc="Get ownership (from another L1)";
+////      // ReqWBiD,          desc="Writeback (L1->L2)";
+////      // ReqWBDi,          desc="Writeback (L2->L1) -- Revoke";
+////      // ReqWBDM,          desc="Writeback (L2->Mem)";
+//     if (type == CoherenceRequestType:ReqRiD) {
+//         return GenericRequestType:DNV_ReqRiD;
+//     } else if (type == CoherenceRequestType:ReqOiD) {
+//         return GenericRequestType:DNV_ReqOiD;
+//     } else if (type == CoherenceRequestType:ReqOiD_line) {
+//         return GenericRequestType:DNV_ReqOiD;
+//     } else if (type == CoherenceRequestType:ReqWBiD
+//     || type == CoherenceRequestType:ReqWBDi
+//     || type == CoherenceRequestType:ReqWBDM) {
+//         return GenericRequestType:REPLACEMENT;
+//     } else if (type == CoherenceRequestType:ReqRiDj
+//     || type == CoherenceRequestType:ReqRiDM) {
+//         return GenericRequestType:DNV_ReqRiD;
+//     } else if (type == CoherenceRequestType:ReqOiDj) {
+//         return GenericRequestType:DNV_ReqOiD;
+//     } else {
+//         DEBUG_EXPR(type);
+//         error("invalid CoherenceRequestType");
+//     }
+////   // ReqWord,       desc="Get word";
+////   // ReqOwn,        desc="Get ownership";
+////   // FwdReqWord,    desc="Forwarded ReqWord";
+////   // FwdReqOwn,     desc="Forwarded ReqOwn";
+////   // WB,            desc="WriteBack";
+////   // RevokeOwn,     desc="Revoking ownership due to L2 Evict";
+////   if(type == CoherenceRequestType:ReqWord) {
+////     return GenericRequestType:DNV_ReqWord;
+////   } else if(type == CoherenceRequestType:ReqOwn) {
+////     return GenericRequestType:DNV_ReqOwn;
+////   } else if(type == CoherenceRequestType:FwdReqWord) {
+////     return GenericRequestType:DNV_FwdReqWord;
+////   } else if(type == CoherenceRequestType:FwdReqOwn) {
+////     return GenericRequestType:DNV_FwdReqOwn;
+////   } else if(type == CoherenceRequestType:WB) {
+////     return GenericRequestType:REPLACEMENT;
+////   } else if(type == CoherenceRequestType:RevokeOwn) {
+////     return GenericRequestType:DNV_RevokeOwn;
+////   } else {
+////     DEBUG_EXPR(type);
+////     error("invalid CoherenceRequestType");
+////   }
+//}

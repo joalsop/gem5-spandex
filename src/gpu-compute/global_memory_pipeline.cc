@@ -36,6 +36,7 @@
 #include "debug/GPUCoalescer.hh"
 #include "debug/GPUMem.hh"
 #include "debug/GPUReg.hh"
+#include "debug/WHD.hh"
 #include "gpu-compute/compute_unit.hh"
 #include "gpu-compute/global_memory_pipeline.hh"
 #include "gpu-compute/gpu_dyn_inst.hh"
@@ -110,6 +111,13 @@ GlobalMemPipeline::exec()
 {
     // apply any returned global memory operations
     GPUDynInstPtr m = getNextReadyResp();
+
+    //if (!gmOrderedRespBuffer.empty()) {
+    //    DPRINTF(WHD, "GMP: Ordered resp buffer:\n");
+    //    for (auto it = gmOrderedRespBuffer.begin(); it != gmOrderedRespBuffer.end(); it++) {
+    //        DPRINTF(WHD, "%lu, %i\n", it->first, it->second.second);
+    //    }
+    //}
 
     bool accessVrf = true;
     Wavefront *w = nullptr;
@@ -213,6 +221,7 @@ GlobalMemPipeline::exec()
              * because once they are issued from the GM pipeline,
              * they do not send any response back to it.
              */
+            //DPRINTF(WHD, "GMP: gmOrderedRespBuffer insert seqNum %lu\n", mp->seqNum());
             gmOrderedRespBuffer.insert(std::make_pair(mp->seqNum(),
                 std::make_pair(mp, false)));
         }
@@ -244,6 +253,7 @@ GlobalMemPipeline::getNextReadyResp()
     if (!gmOrderedRespBuffer.empty()) {
         auto mem_req = gmOrderedRespBuffer.begin();
 
+        //DPRINTF(WHD, "GMP: gmOrderedRespBuffer head: %lu\n", mem_req->first);
         if (mem_req->second.second) {
             return mem_req->second.first;
         }
@@ -268,6 +278,9 @@ GlobalMemPipeline::completeRequest(GPUDynInstPtr gpuDynInst)
     assert(gmOrderedRespBuffer.begin()->first == gpuDynInst->seqNum());
     assert(gmOrderedRespBuffer.begin()->second.first == gpuDynInst);
     assert(gmOrderedRespBuffer.begin()->second.second);
+
+    //DPRINTF(WHD, "GMP: Completing request: seqNum %lu\n", gpuDynInst->seqNum());
+
     // remove this instruction from the buffer by its
     // unique seq ID
     gmOrderedRespBuffer.erase(gpuDynInst->seqNum());
@@ -302,10 +315,12 @@ GlobalMemPipeline::issueRequest(GPUDynInstPtr gpuDynInst)
 void
 GlobalMemPipeline::handleResponse(GPUDynInstPtr gpuDynInst)
 {
+    //DPRINTF(WHD, "GMP: handleResponse for seqNum: %lu\n",gpuDynInst->seqNum());
     auto mem_req = gmOrderedRespBuffer.find(gpuDynInst->seqNum());
     // if we are getting a response for this mem request,
     // then it ought to already be in the ordered response
     // buffer
+    //DPRINTF(WHD, "GMP: Found handle for seqNum: %lu\n", mem_req->first);
     assert(mem_req != gmOrderedRespBuffer.end());
     mem_req->second.second = true;
 }

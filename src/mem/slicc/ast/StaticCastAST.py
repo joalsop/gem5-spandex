@@ -41,15 +41,20 @@ class StaticCastAST(ExprAST):
         actual_type, ecode = self.expr_ast.inline(True)
         if self.type_modifier == "pointer":
             code('static_cast<${{self.type_ast.type.c_ident}} *>($ecode)')
+        elif self.type_modifier == "state":
+            code('static_cast<${{self.type_ast.type.c_ident}}>($ecode)')
         else:
             code('static_cast<${{self.type_ast.type.c_ident}} &>($ecode)')
 
-        if not "interface" in self.type_ast.type:
+        state_hack = "State" == str(self.type_ast.type)
+        if not "interface" in self.type_ast.type and not state_hack:
             self.expr_ast.error("static cast only premitted for those types " \
-                                "that implement inherit an interface")
+                                "that implement inherit an interface." \
+                                " Also state enumerations")
 
-        # The interface type should match
-        if str(actual_type) != str(self.type_ast.type["interface"]):
+        # The interface type should match if not State
+        if (not state_hack and
+            str(actual_type) != str(self.type_ast.type["interface"]) ):
             self.expr_ast.error("static cast miss-match, type is '%s'," \
                                 "but inherited type is '%s'",
                                 actual_type, self.type_ast.type["interface"])

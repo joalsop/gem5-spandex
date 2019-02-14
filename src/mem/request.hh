@@ -60,6 +60,7 @@
 #include "base/compiler.hh"
 #include "base/flags.hh"
 #include "base/types.hh"
+#include "gem5/denovo_region_api.h"
 #include "cpu/inst_seq.hh"
 #include "mem/htm.hh"
 #include "sim/cur_tick.hh"

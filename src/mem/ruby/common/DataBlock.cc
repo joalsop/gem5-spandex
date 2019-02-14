@@ -39,7 +39,6 @@
  */
 
 #include "mem/ruby/common/DataBlock.hh"
-
 #include "mem/ruby/common/WriteMask.hh"
 #include "mem/ruby/system/RubySystem.hh"
 

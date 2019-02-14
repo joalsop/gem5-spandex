@@ -1,0 +1,7 @@
+protocol "DeNovo";
+include "RubySlicc_interfaces.slicc";
+include "DeNovo-msg.sm";
+include "Loopback-dma.sm";
+include "Loopback-ICache.sm";
+include "Loopback-L1.sm";
+include "Loopback-L2.sm";

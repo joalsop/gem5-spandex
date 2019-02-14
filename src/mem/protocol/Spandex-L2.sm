@@ -1,0 +1,1336 @@
+machine(MachineType:L2Cache, "Loopback L2 Cache") :
+    DirectoryMemory *directory;
+    CacheMemory * L2cache;
+    Cycles l2_request_latency := 50;
+    Cycles l2_response_latency := 20;
+
+    /* DMA */
+    //MessageBuffer * requestFromDMA, network="From", virtual_network="1", vnet_type="request";
+    //MessageBuffer * responseToDMA, network="To", virtual_network="3", vnet_type="request";
+
+    /* INGRESS */
+    // a local L1 -> this L2 bank
+    MessageBuffer * requestFromL1, network="From", virtual_network="1", vnet_type="request";
+    // a local L1 -> this L2 bank
+    MessageBuffer * responseFromL1, network="From", virtual_network="3", vnet_type="response";
+
+    /* EGRESS */
+    MessageBuffer * responseToL1, network="To", virtual_network="3", vnet_type="response";
+    MessageBuffer * requestToL1, network="To", virtual_network="1", vnet_type="request";
+
+    /* Memory */
+    MessageBuffer *requestToMemory;
+    MessageBuffer *responseFromMemory;
+{
+    // Used to for functions that would be static outside of SLICC
+    WriteMask static_WriteMask;
+
+    /*******************************STATES*************************************/
+    state_declaration(State, desc="Primary Cache States", default="L2Cache_State_I") {
+        // Base States
+        I,  AccessPermission:Invalid,    desc="Line Invalid, not cached (L2 Owned)";
+        V,  AccessPermission:Read_Only,  desc="Line Valid, potentially dirty";
+        CO, AccessPermission:Read_Write, desc="A core owns at least a word in this line";
+        S,  AccessPermission:Read_Only,  desc="One or more cores share this line";
+
+        // Transient States
+        I_V,     AccessPermission:Busy, desc="L2 idle, issued ReqRiDM for ReqRiD, have not seen response yet";
+        I_S,     AccessPermission:Busy, desc="Waiting on MemRead response to respond to ReqS";
+        I_CO,    AccessPermission:Busy, desc="L2 idle, issued ReqRiDM for L1 ownership request, have not seen response yet";
+        V_I,    AccessPermission:Busy, desc="Replaced while in dirty V, waiting for ReqWBDM from mem";
+        S_I,    AccessPermission:Busy, desc="Replaced while in S, waiting for ReqWBDM from mem and Ack from sharers";
+        S_V,    AccessPermission:Busy, desc="Got ReqWB or ReqAiD while in S, waiting for Ack from sharers";
+        S_CO,   AccessPermission:Busy, desc="Got ReqO[A] while in S, waiting for Ack from sharers";
+        CO_S,   AccessPermission:Busy, desc="Got ReqS while in CO (exclusively owned by a single MESI cache), waiting for ReqWBiD";
+        CO_V,   AccessPermission:Busy, desc="Got ReqA for core owned words, waiting for ReqWBiD";
+        //CO_V_I, AccessPermission:Busy, desc="L2 replacing, waiting for ReqWBiD from core owners";
+
+        OWB,    AccessPermission:Busy, desc="Waiting on owned data to WB";
+        SWB,    AccessPermission:Busy, desc="Waiting on sharer inv acks and MemWB ack";
+        WB,     AccessPermission:Busy, desc="Waiting on MemWB ack";
+    }
+
+    /*******************************EVENTS*************************************/
+    enumeration(Event, desc="Cache Events") {
+        ReqV,       desc="Process request for data";
+        ReqS,       desc="Process request for shared data";
+        ReqWB_L2,   desc="Process request for data WB to L2";
+        ReqWB_L2_LO,   desc="Process request for data WB to L2 if it is the last owned words";
+        ReqWB_L2_partial,   desc="Process request for data WB to L2 if the requestor doesn't have ownership for all req words";
+        ReqO,       desc="Process request for data ownership";
+        ReqOdata,   desc="Process request for data ownership and data value";
+        ReqWT,      desc="Process request for data writethough";
+        ReqWT_LO,   desc="Process request for data writethough on the last owned words";
+        ReqWTdata,  desc="TODO";
+        ReqWTdata_LO,  desc="TODO";
+        Repl,       desc="Process request to replace L2 cacheline";
+        Repl_dirty, desc="Process request to replace dirty L2 cacheline";
+
+        AckS,       desc="Process Ack from InvS";
+        AckS_LS,    desc="Process Ack from InvS, last sharer";
+
+        RspRvkO,    desc="Process the response to a RvkO request";
+        RspRvkO_LO, desc="Process the response to a RvkO request for last owner in a line";
+
+        // Memory Responses
+        RspMemData, desc="Data response from memory";
+        RspWB_Mem,  desc="WB response from memory";
+    }
+
+    /***************************STRUCTURES*************************************/
+    structure(Entry, desc="...", interface="AbstractCacheEntry") {
+        State CacheState,           desc="cache state";
+        bool Dirty,                 desc="Is the data dirty (diff than memory)?";
+        DataBlock DataBlk,          desc="data for the block";
+        WriteMask writeMask,        desc="written bytes masks";
+        NetDest Sharers,            desc="L1 sharers";
+        OwnerVec Owners,            desc="Word owners";
+    }
+
+    //structure(DirEntry, desc="Directory Entry", interface="AbstractEntry") {
+    //    StateVec DirState,  desc="Dir state";
+    //    DataBlock DataBlk,  desc="Data block";
+    //}
+
+    structure(TBE, desc="...") {
+        Addr Address,    desc="Physical address for this TBE";
+        State TBEState,     desc="Transient state";
+        DataBlock DataBlk,  desc="data for the block, required for concurrent writebacks";
+        bool Dirty,         default="false", desc="Is the data dirty (different than memory)?";
+        int NumPendingMsgs, default=0, desc="Number of acks/data messages that this processor is waiting for";
+        bool isPrefetch,    default="false", desc="Set if this was caused by a prefetch";
+        NetDest Requestor,  desc="Requesting core(s) for the outstanding request";
+        WriteMask RequestMask, desc="Bit mask for tracking what words in a request are outstanding";
+        bool isDataReq,     desc="Does the originating request require data (e.g. ReqOdata,ReqWTdata->true, ReqO->false)";
+     }
+
+    structure(TBETable, external="yes") {
+        TBE lookup(Addr);
+        void allocate(Addr);
+        void deallocate(Addr);
+        bool isPresent(Addr);
+    }
+
+    TBETable TBEs, template="<L2Cache_TBE>", constructor="m_number_of_TBEs";
+    int L2C_select_low_bit, default="RubySystem::getBlockSizeBits()";
+
+    
+    void set_tbe(TBE a);
+    void unset_tbe();
+    void set_cache_entry(AbstractCacheEntry b);
+    void unset_cache_entry();
+    void wakeUpBuffers(Addr a);
+    void wakeUpAllBuffers(Addr a);
+    void wakeUpAllBuffers();
+
+    /********************INTERNAL FUNCTIONS************************************/
+    //Taken from GPU_VIPER-TCP
+    //
+    Tick clockEdge();
+    Entry getCacheEntry(Addr address), return_by_pointer="yes" {
+        Entry cache_entry := static_cast(Entry, "pointer", L2cache.lookup(address));
+        return cache_entry;
+    }
+
+    void functionalRead(Addr addr, Packet *pkt) {
+        TBE tbe := TBEs.lookup(addr);
+        if(is_valid(tbe)) {
+            testAndRead(addr, tbe.DataBlk, pkt);
+        } else {
+            functionalMemoryRead(pkt);
+        }
+    }
+
+    int functionalWrite(Addr addr, Packet *pkt) {
+        int num_functional_writes := 0;
+
+        TBE tbe := TBEs.lookup(addr);
+        if(is_valid(tbe)) {
+            num_functional_writes := num_functional_writes +
+                testAndWrite(addr, tbe.DataBlk, pkt);
+        }
+
+        num_functional_writes := num_functional_writes +
+            functionalMemoryWrite(pkt);
+        return num_functional_writes;
+    }
+
+    AccessPermission getAccessPermission(Addr addr) {
+        //TBE tbe := TBEs.lookup(addr);
+        //if(is_valid(tbe)) {
+        //    return L1Cache_State_to_permission(tbe.TBEState);
+        //}
+
+        //Entry cache_entry := getCacheEntry(addr);
+        //if(is_valid(cache_entry)) {
+        //    return L1Cache_State_to_permission(cache_entry.CacheState);
+        //}
+
+        return AccessPermission:NotPresent;
+    }
+
+    State getState(TBE tbe, Entry cache_entry, Addr addr) {
+        if (is_valid(tbe)) {
+            return tbe.TBEState;
+        } else if (is_valid(cache_entry)) {
+            return cache_entry.CacheState;
+        }
+        return State:I;
+    }
+
+    void setState(TBE tbe, Entry cache_entry, Addr addr, State state) {
+        if (is_valid(tbe)) {
+            tbe.TBEState := state;
+        }
+        if (is_valid(cache_entry)) {
+            cache_entry.CacheState := state;
+        }
+    }
+
+    void setAccessPermission(Entry cache_entry, Addr addr, State state) {
+        //if (is_valid(cache_entry)) {
+        //    cache_entry.changePermission(L1Cache_State_to_permission(state)tbe
+    }
+
+    //DirEntry getDirectoryEntry(Addr addr), return_by_pointer="yes" {
+    //    DirEntry dir_entry := static_cast(DirEntry, "pointer", directory.lookup(addr));
+    //    if (is_valid(dir_entry)) {
+    //        return dir_entry;
+    //    }
+    //    dir_entry := static_cast(DirEntry, "pointer", directory.allocate(addr, new DirEntry));
+    //    return dir_entry;
+    //}
+
+
+    /**************************OUT PORT****************************************/
+    //out_port(dmaResponseQueue_out, DMAResponseMsg, responseToDMA);
+    out_port(responseToCore_out, ResponseMsg, responseToL1);
+    out_port(requestToCore_out, RequestMsg, requestToL1);
+    out_port(memQueue_out, MemoryMsg, requestToMemory);
+
+    /***************************IN PORT****************************************/
+    //in_port(dmaRequestQueue_in, DMARequestMsg, requestFromDMA) {
+    //  if (dmaRequestQueue_in.isReady(clockEdge())) {
+    //    peek(dmaRequestQueue_in, DMARequestMsg) {
+    //      TBE tbe := TBEs.lookup(in_msg.LineAddress);
+    //      CacheEntry entry := getCacheEntry(in_msg.LineAddress);
+    //      WriteMask tmp;
+    //      tmp.fillMask();
+    //      if (in_msg.Type == DMARequestType:READ) {
+    //        triggerLine(Event:DmaRead, in_msg.LineAddress, entry, tbe, tmp);
+    //      } else if (in_msg.Type == DMARequestType:WRITE) {
+    //        triggerLine(Event:DmaWrite, in_msg.LineAddress, entry, tbe, tmp);
+    //      } else {
+    //        error("Unknown DMA msg");
+    //      }
+    //    }
+    //  }
+    //}
+
+    // Responses from memory
+    in_port(memQueue_in, MemoryMsg, responseFromMemory) {
+        if (memQueue_in.isReady(clockEdge())) {
+            peek(memQueue_in, MemoryMsg) {
+                TBE tbe := TBEs.lookup(in_msg.addr);
+                Entry cache_entry := static_cast(Entry, "pointer", L2cache.lookup(in_msg.addr));
+                if (in_msg.Type == MemoryRequestType:MEMORY_READ) {
+                    if (is_valid(cache_entry) || L2cache.cacheAvail(in_msg.addr)) { 
+                        DPRINTF(RubySlicc, "Message response from memory: %s\n", in_msg);
+                        trigger(Event:RspMemData, in_msg.addr, cache_entry, tbe);
+                    } else {
+                        Addr victim := L2cache.cacheProbe(in_msg.addr);
+                        DPRINTF(RubySlicc, "Full cache, kicking victim 0x%x for 0x%x\n", victim, in_msg.addr);
+                        trigger(Event:Repl, victim, getCacheEntry(victim), TBEs.lookup(victim));
+                    }
+                } else if (in_msg.Type == MemoryRequestType:MEMORY_WB) {
+                    trigger(Event:RspWB_Mem, in_msg.addr, cache_entry, tbe); // ignore WBAcks, don't care about them.
+                } else {
+                  DPRINTF(RubySlicc, "%s\n", in_msg.Type);
+                  error("Invalid message");
+                }
+            }
+        }
+    }
+
+    in_port(responseFromL1_in, ResponseMsg, responseFromL1, desc="In-port for responses from L1") {
+        if (responseFromL1_in.isReady(clockEdge())) {
+            peek(responseFromL1_in, ResponseMsg, block_on="LineAddress") {
+                Entry cache_entry := getCacheEntry(in_msg.LineAddress);
+                TBE tbe := TBEs.lookup(in_msg.LineAddress);
+                if (in_msg.Type == CoherenceResponseType:Ack) {
+                    //TODO RN I'm assuming that this will only be a resp to InvS, but it might not be
+                    if (tbe.NumPendingMsgs == 1){
+                        trigger(Event:AckS_LS, in_msg.LineAddress, cache_entry, tbe);
+                    } else {
+                        trigger(Event:AckS, in_msg.LineAddress, cache_entry, tbe);
+                    }
+                } else if (in_msg.Type == CoherenceResponseType:RspRvkO) {
+                    trigger(Event:RspRvkO, in_msg.LineAddress, cache_entry, tbe); 
+                } else {
+                    DPRINTF(RubySlicc,"%s", in_msg);
+                    error("Unsupported L1 response type");
+                }
+            }
+        }
+    }
+
+    in_port(requestFromL1_in, RequestMsg, requestFromL1, desc="In-port for requests from L1") {
+        if (requestFromL1_in.isReady(clockEdge())) {
+            peek(requestFromL1_in, RequestMsg, block_on="LineAddress") {
+                Entry cache_entry := getCacheEntry(in_msg.LineAddress);
+                TBE tbe := TBEs.lookup(in_msg.LineAddress);
+                if (in_msg.Type == CoherenceRequestType:ReqV) {
+                    trigger(Event:ReqV, in_msg.LineAddress, cache_entry, tbe);
+                } else if (in_msg.Type == CoherenceRequestType:ReqWB_L2) {
+                    DPRINTF(RubySlicc,"%s",in_msg);
+                    if (cache_entry.Owners.isOwner(in_msg.Requestor, in_msg.bitMask)) {
+                        if (cache_entry.Owners.isLastOwner(in_msg.bitMask)) {
+                            trigger(Event:ReqWB_L2_LO, in_msg.LineAddress, cache_entry, tbe);
+                        } else {
+                            trigger(Event:ReqWB_L2, in_msg.LineAddress, cache_entry, tbe);
+                        }
+                    } else {
+                        trigger(Event:ReqWB_L2_partial, in_msg.LineAddress, cache_entry, tbe);
+                    }
+                } else if (in_msg.Type == CoherenceRequestType:ReqWT) {
+                    // TODO Probably need to add the full cache check here
+                    if (cache_entry.Owners.isLastOwner(in_msg.bitMask)) {
+                        trigger(Event:ReqWT_LO, in_msg.LineAddress, cache_entry, tbe); 
+                    } else {
+                        trigger(Event:ReqWT, in_msg.LineAddress, cache_entry, tbe); 
+                    }
+                } else if (in_msg.Type == CoherenceRequestType:ReqWTData) {
+                    // TODO Probably need to add the full cache check here
+                    if (cache_entry.Owners.isLastOwner(in_msg.bitMask)) {
+                        trigger(Event:ReqWTdata_LO, in_msg.LineAddress, cache_entry, tbe); 
+                    } else {
+                        trigger(Event:ReqWTdata, in_msg.LineAddress, cache_entry, tbe); 
+                    }
+
+                } else if (in_msg.Type == CoherenceRequestType:ReqO) {
+                    if (is_valid(cache_entry) || L2cache.cacheAvail(in_msg.LineAddress)) { 
+                        trigger(Event:ReqO, in_msg.LineAddress, cache_entry, tbe);
+                    } else {
+                        Addr victim := L2cache.cacheProbe(in_msg.LineAddress);
+                        DPRINTF(RubySlicc, "Full cache, kicking victim 0x%x for 0x%x\n", victim, in_msg.LineAddress);
+                        trigger(Event:Repl, victim, getCacheEntry(victim), TBEs.lookup(victim));
+                    }
+                } else if (in_msg.Type == CoherenceRequestType:ReqOData) {
+                    trigger(Event:ReqOdata, in_msg.LineAddress, cache_entry, tbe);
+                } else {
+                    DPRINTF(RubySlicc,"%s", in_msg);
+                    error("Unexpected Response Message to Core");
+                }
+            }
+        }
+    }   
+
+
+    /**********************************ACTIONS********************************/
+    action(p_popRequestFromL1, "p", desc="Pop L1 request queue") {
+        requestFromL1_in.dequeue(clockEdge());
+    }
+
+    action(p_popResponseFromL1, "pr", desc="Pop L1 response queue") {
+        responseFromL1_in.dequeue(clockEdge());
+    }
+
+    action(pm_popMemQueue, "pm", desc="Pop memory response queue") {
+        memQueue_in.dequeue(clockEdge());
+    }
+
+    action(a_allocate, "a", desc="allocate cache block") {
+        if (is_invalid(cache_entry)) {
+            set_cache_entry(L2cache.allocate(address, new Entry));
+        }
+        cache_entry.writeMask.clear();
+    }
+
+    action(ic_invCache, "ic", desc="invalidate cache line") {
+        assert(is_valid(cache_entry));
+        L2cache.deallocate(makeLineAddress(address));
+        unset_cache_entry();
+    }
+
+    action(rspv_respondV_L2Hit, "l2rspv", desc="generate response to reqv when data is in l2") {
+        peek(requestFromL1_in, RequestMsg) {
+        DPRINTF(RubySlicc, "RspV: LineAddr: 0x%x", in_msg.LineAddress);
+            enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+                out_msg.LineAddress := in_msg.LineAddress;
+                out_msg.Type := CoherenceResponseType:RspV;
+                out_msg.Sender := machineID;
+                out_msg.DataBlk := cache_entry.DataBlk;
+                out_msg.Destination.add(in_msg.Requestor);
+                out_msg.MessageSize := MessageSizeType:ResponseL2hit_Data;
+                out_msg.bitMask.fillMask();
+            }
+        }
+    }
+
+    action(rspv_respondV_mem, "rspvm", desc="generate response to reqv when data returns from memory") {
+        if (is_valid(tbe)) {
+            Addr LineAddress := makeLineAddress(address);
+            DPRINTF(RubySlicc, "RspV LineAddr: 0x%x, requestor: %s\n", LineAddress, tbe.Requestor);
+            enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+                out_msg.LineAddress := LineAddress;
+                out_msg.Type := CoherenceResponseType:RspV;
+                out_msg.Sender := machineID;
+                out_msg.DataBlk := cache_entry.DataBlk;
+                out_msg.Destination.addNetDest(tbe.Requestor);
+                out_msg.MessageSize := MessageSizeType:ResponseL2hit_Data;
+                out_msg.bitMask.fillMask();
+            }
+        } else {
+            error("Expected TBE for rspvm");
+        }
+    }
+
+    action(rspv_respondV_partial, "L2rspv_p", desc="Generate response to reqV when data is in L2, partial line") {
+        peek(requestFromL1_in, RequestMsg) {
+            WriteMask tmp;
+            tmp.cpyMask(in_msg.bitMask);
+            WriteMask tmp2 := cache_entry.Owners.getOwnerMask();
+            tmp2.invertMask();
+            tmp.andMask(tmp2);
+
+            DPRINTF(RubySlicc, "PartialRspV: Addr: 0x%x, LineAddr: 0x%x mask: %s\n", address, in_msg.LineAddress, tmp);
+            if (!tmp.isEmpty()) {
+                enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+                    out_msg.LineAddress := in_msg.LineAddress;
+                    out_msg.Type := CoherenceResponseType:RspV;
+                    out_msg.Sender := machineID;
+                    // TODO If we have an L2 hit, do we optimize by sending the full line
+                    // similar to other times
+                    // For now, I'm responding with just the requested words
+                    out_msg.DataBlk.copyPartial(cache_entry.DataBlk, tmp);
+                    out_msg.Destination.add(in_msg.Requestor);
+                    out_msg.MessageSize := MessageSizeType:ResponseL2hit_Data;
+                    out_msg.bitMask.cpyMask(tmp);
+                }
+            }
+        }
+    }
+
+    action(ifrv_issueFwdReqV, "ifrv", desc="Issue a FwdReqV to remote owner(s)") {
+        peek(requestFromL1_in, RequestMsg) {
+            DPRINTF(RubySlicc, "FwdReqV: Addr 0x%x, LineAddr: 0x%x\n", address, in_msg.LineAddress);
+            enqueue(requestToCore_out, RequestMsg, l2_response_latency) {
+                out_msg.LineAddress := in_msg.LineAddress;
+                out_msg.Type := CoherenceRequestType:FwdReqV;
+                out_msg.Requestor := in_msg.Requestor;
+                out_msg.Destination.addNetDest(cache_entry.Owners.getOwnerNetDest());
+                out_msg.MessageSize := MessageSizeType:Reissue_Control;
+                out_msg.bitMask.cpyMask(cache_entry.Owners.getOwnerMask());
+                out_msg.OwnerInfo.cpyVec(cache_entry.Owners);
+            }
+        }
+    }
+
+    action(imr_issueMemRead, "imr", desc="Issue read to main memory") {
+        assert(address == makeLineAddress(address));
+        if (requestFromL1_in.isReady(clockEdge())) {
+            peek (requestFromL1_in, RequestMsg) {
+                tbe.Requestor.add(in_msg.Requestor);
+                // NOTE: for a memread, the full data line is requested (generally)
+                tbe.RequestMask.fillMask();
+            }
+        } 
+        enqueue(memQueue_out, MemoryMsg, l2_request_latency) {
+            out_msg.addr := address;
+            out_msg.Type := MemoryRequestType:MEMORY_READ;
+            out_msg.Sender := machineID;
+            out_msg.MessageSize := MessageSizeType:Request_Control;
+        }
+    }
+
+    action(imw_issueMemWrite, "imw", desc="Issue write to main memory") {
+        assert(address == makeLineAddress(address));
+        enqueue(memQueue_out, MemoryMsg, l2_request_latency) {
+            out_msg.addr := address;
+            out_msg.Type := MemoryRequestType:MEMORY_WB;
+            out_msg.Sender := machineID;
+            out_msg.MessageSize := MessageSizeType:Data;
+        }
+    }
+
+    action(t_allocateTBE, "t", desc="Allocate TBE") {
+        if (is_invalid(tbe)) {
+            Addr lineAddr := makeLineAddress(address);
+            check_allocate(TBEs);
+            TBEs.allocate(lineAddr);
+            set_tbe(TBEs.lookup(lineAddr));
+            if (is_valid(cache_entry)) {
+                tbe.DataBlk := cache_entry.DataBlk;
+                tbe.Dirty := cache_entry.Dirty;
+            }
+            /* NOTE
+             * We leave the TBE values like dirty and number acks uninitialized in TBE allocation.
+             * They will be assigned to the appropriate values in the issue actions.*/
+        }
+    }
+
+    action(mtd_markTBEData, "mtd", desc="Mark the isDataReq field in the TBE") {
+        tbe.isDataReq := true;
+    }
+
+    action(dp_decrementPendingMsgs, "dp", desc="Decrement NumPendingMsgs in TBE upon AckS") {
+        tbe.NumPendingMsgs := tbe.NumPendingMsgs - 1;
+    }
+
+
+    action(d_deallocateTBE, "d", desc="Deallocate TBE") {
+        Addr lineAddr := makeLineAddress(address);
+        TBEs.deallocate(lineAddr);
+        unset_tbe();
+    }
+
+    action(rs_registerSharer, "ns", desc="Register a sharer for a line") {
+        peek(requestFromL1_in, RequestMsg) {
+            cache_entry.Sharers.add(in_msg.Requestor);
+        }
+    }
+
+    action(ds_deregisterSharer, "ds", desc="Deregister a sharer for a line") {
+        peek(responseFromL1_in, ResponseMsg) {
+            cache_entry.Sharers.remove(in_msg.Sender);
+        }
+    }
+
+    action(rsps_respondS, "rsps", desc="Respond with sharer data") {
+        // NOTE Shared is only used for MESI which is line granularity
+        // so we always respond with the full line
+        peek(requestFromL1_in, RequestMsg) {
+            enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+                out_msg.LineAddress := in_msg.LineAddress;
+                out_msg.Type := CoherenceResponseType:RspS;
+                out_msg.Sender := machineID;
+                out_msg.DataBlk := cache_entry.DataBlk;
+                out_msg.Destination.add(in_msg.Requestor);
+                out_msg.MessageSize := MessageSizeType:ResponseL2hit_Data;
+                out_msg.bitMask.fillMask();
+            }
+        }
+    }
+
+    action(rsps_respondS_mem, "rspsm", desc="Respond with sharer data recieved from mem load") {
+        // NOTE Shared is only used for MESI which is line granularity
+        // so we always respond with the full line
+        if (is_valid(tbe)) {
+            peek(memQueue_in, MemoryMsg) {
+                enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+                    out_msg.LineAddress := address;
+                    out_msg.Type := CoherenceResponseType:RspS;
+                    out_msg.Sender := machineID;
+                    out_msg.DataBlk := cache_entry.DataBlk;
+                    out_msg.Destination.addNetDest(tbe.Requestor);
+                    out_msg.MessageSize := MessageSizeType:ResponseL2hit_Data;
+                    out_msg.bitMask.fillMask();
+                }
+            }
+        } else {
+            error("Expected TBE for rspsm");
+        }
+    }
+
+    action(ifrs_issueFwdReqS, "ifrs", desc="Issue a FwdReqS to line owners") {
+        peek(requestFromL1_in, RequestMsg) {
+            enqueue(requestToCore_out, RequestMsg, l2_response_latency) {
+                out_msg.LineAddress := in_msg.LineAddress;
+                out_msg.Type := CoherenceRequestType:FwdReqS;
+                out_msg.Requestor := in_msg.Requestor;
+                out_msg.Destination.addNetDest(cache_entry.Owners.getOwnerNetDest());
+                out_msg.MessageSize := MessageSizeType:Reissue_Control;
+                out_msg.bitMask.cpyMask(cache_entry.Owners.getOwnerMask());
+                out_msg.OwnerInfo.cpyVec(cache_entry.Owners);
+            }
+        }
+    }
+
+    action(ro_registerOwner, "ro", desc="Register/update the owner of words") {
+        if (is_valid(cache_entry)) {
+            peek(requestFromL1_in, RequestMsg) {
+                cache_entry.Owners.setOwner(in_msg.bitMask, in_msg.Requestor);
+            }
+        }
+    }
+
+    action(ds_deregisterSelf, "dsf", desc="Deregister the owner of words, making LLC owner, confirms requestor is owner") {
+        peek(requestFromL1_in, RequestMsg) {
+            // Note: the unsetOwner function verifies the requestor is the owner
+            // according to the calling OwnerVec (in this case the LLC)
+            cache_entry.Owners.unsetOwner(in_msg.bitMask, in_msg.Requestor);
+        }
+    }
+
+    action(do_deregisterOwner, "do", desc="Deregister current owner of words, making LLC owner") {
+        peek(requestFromL1_in, RequestMsg) {
+            cache_entry.Owners.unsetOwner(in_msg.bitMask);
+        }
+    }
+
+    action(rspo_respondO, "rspo", desc="Respond to an ownership request") {
+        enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+            peek(requestFromL1_in, RequestMsg) {
+                out_msg.Destination.add(in_msg.Requestor);
+                out_msg.bitMask.cpyMask(in_msg.bitMask);
+                out_msg.LineAddress := address;
+                out_msg.Type := CoherenceResponseType:RspO;
+                out_msg.Sender := machineID;
+                out_msg.MessageSize := MessageSizeType:Response_Control;
+            }
+        }
+    }
+
+    action(rspom_respondO_mixed, "rspom", desc="Respond to an ownership request the required delay") {
+        if (is_valid(tbe)) {
+            if (tbe.isDataReq) {
+                enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+                    out_msg.Destination.addNetDest(tbe.Requestor);
+                    out_msg.bitMask.cpyMask(tbe.RequestMask);
+                    out_msg.LineAddress := address;
+                    out_msg.Sender := machineID;
+                    out_msg.MessageSize := MessageSizeType:Response_Control;
+                    out_msg.Type := CoherenceResponseType:RspOdata;
+                    out_msg.DataBlk.copyPartial(cache_entry.DataBlk, tbe.RequestMask);
+                }
+            } 
+        } else {
+            error("Expected TBE for RspO data"); 
+        }
+    }
+
+    action(rspo_respondO_partial, "rspo_p", desc="Respond to an ownership request not all of the words are valid") {
+        peek(requestFromL1_in, RequestMsg) {
+            WriteMask tmp_msg;
+            tmp_msg.cpyMask(in_msg.bitMask);
+            WriteMask tmp_own := cache_entry.Owners.getOwnerMask();
+            tmp_own.invertMask();
+            tmp_msg.andMask(tmp_own);
+            if (!tmp_msg.isEmpty()) {
+                enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+                    out_msg.LineAddress := in_msg.LineAddress;
+                    out_msg.Type := CoherenceResponseType:RspO;
+                    out_msg.Sender := machineID;
+                    out_msg.MessageSize := MessageSizeType:Response_Control;
+                    out_msg.Destination.add(in_msg.Requestor);
+                    out_msg.bitMask.cpyMask(tmp_msg);
+                }
+            }
+        } 
+    }
+
+    action(ifro_issueFwdReqO, "ifro", desc="Issue FwdReqO to owning core(s)") {
+        peek(requestFromL1_in, RequestMsg) {
+            WriteMask tmp_msg;
+            tmp_msg.cpyMask(in_msg.bitMask);
+            WriteMask tmp_own := cache_entry.Owners.getOwnerMask();
+            tmp_msg.andMask(tmp_own); // Intersection of requested words and owned words
+
+            if (!tmp_msg.isEmpty()) {
+                enqueue(requestToCore_out, RequestMsg, l2_response_latency) {
+                    out_msg.LineAddress := in_msg.LineAddress;
+                    out_msg.Type := CoherenceRequestType:FwdReqO;
+                    out_msg.Requestor := in_msg.Requestor;
+                    out_msg.MessageSize := MessageSizeType:Request_Control;
+                    out_msg.Destination.addNetDest(cache_entry.Owners.getOwnerNetDest());
+                    out_msg.bitMask.cpyMask(tmp_msg);
+                    out_msg.OwnerInfo.cpyVec(cache_entry.Owners);
+                }
+            }
+        }
+    }
+
+    action(iinvs_issueInvS, "iinvs", desc="Issue invalidate request to sharers") {
+        WriteMask tmp;
+        tmp.fillMask();
+        // NOTE will fill the bitMask because sharing is done at the line gran always
+        peek(requestFromL1_in, RequestMsg) {
+            tbe.NumPendingMsgs := cache_entry.Sharers.count();
+            if ( (in_msg.Type == CoherenceRequestType:ReqOData) || (in_msg.Type == CoherenceRequestType:ReqWTData) ) {
+                tbe.isDataReq := true;
+            } else {
+                tbe.isDataReq := false;
+            }
+
+            enqueue(requestToCore_out, RequestMsg, l2_response_latency) {
+                out_msg.LineAddress := in_msg.LineAddress;
+                out_msg.Type := CoherenceRequestType:Inv;
+                out_msg.Requestor := machineID;
+                out_msg.Destination.addNetDest(cache_entry.Sharers);
+                out_msg.MessageSize := MessageSizeType:Request_Control;
+                out_msg.bitMask.cpyMask(tmp);
+            }
+        } 
+    }
+
+    action(s_storeDone, "s", desc="Complete a data store") {
+        peek(requestFromL1_in, RequestMsg) {
+            /* NOTE if this line is present in the TBETable, that means
+             * we are waiting on a MemLoad.  Since we've just written some
+             * of that data, we must unset the bitMask so that it isn't
+             * overwritten when the MemLoad returns */
+            if (is_valid(tbe)) {
+                tbe.RequestMask.unsetMask(in_msg.bitMask);
+            }
+
+            cache_entry.DataBlk.copyPartial(in_msg.DataBlk, in_msg.bitMask);
+            cache_entry.writeMask.orMask(in_msg.bitMask);
+            cache_entry.Dirty := true;
+        } 
+    }
+
+    action(l_loadDone, "l", desc="Complete a data load from memory") {
+        peek(memQueue_in, MemoryMsg) {
+            if (is_valid(tbe)) {
+                cache_entry.DataBlk.copyPartial(in_msg.DataBlk, tbe.RequestMask);
+                cache_entry.writeMask.orMask(tbe.RequestMask);
+                cache_entry.Dirty := true;
+            } else {
+                error("Expected TBE for MemRsp");
+            }
+        }
+    }
+
+    action(rspwt_respondWT, "rspwt", desc="Respond to ReqWT") {
+        peek(requestFromL1_in, RequestMsg) {
+            enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+                out_msg.LineAddress := in_msg.LineAddress;
+                out_msg.Type := CoherenceResponseType:RspWT;
+                out_msg.Sender := machineID;
+                out_msg.MessageSize := MessageSizeType:Response_Control;
+                out_msg.Destination.add(in_msg.Requestor);
+                out_msg.bitMask.cpyMask(in_msg.bitMask);
+            }
+        } 
+    }
+
+    action(rspod_respondOdata, "rspod", desc="Respond to ReqOdata") {
+        enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+            if (is_valid(tbe)) {
+                error("Unexpected TBE");
+                //out_msg.Destination.addNetDest(tbe.Requestor);
+                //out_msg.bitMask.cpyMask(tbe.RequestMask);
+                //out_msg.DataBlk.copyPartial(cache_entry.DataBlk, tbe.RequestMask);
+                /* 
+                 * NOTE if there is a valid entry in the TBETable (e.g. we were
+                 * waiting on inv acks for a shared line), use that to determine
+                 * who we send the rspOdata to.
+                 *
+                 * THIS HAS BEEN MOVED TO rspom
+                 * */
+            } else {
+                peek(requestFromL1_in, RequestMsg) {
+                    out_msg.Destination.add(in_msg.Requestor);
+                    out_msg.bitMask.cpyMask(in_msg.bitMask);
+                    out_msg.DataBlk.copyPartial(cache_entry.DataBlk, in_msg.bitMask);
+                }
+            }
+            out_msg.LineAddress := address;
+            out_msg.Type := CoherenceResponseType:RspOdata;
+            out_msg.Sender := machineID;
+            out_msg.MessageSize := MessageSizeType:Response_Control;
+        }
+    }
+
+    action(rspodp_respondOdata_partial, "rspodp", desc="RspO if not all words are in valid state") {
+        peek(requestFromL1_in, RequestMsg) {
+            WriteMask tmp_msg;
+            tmp_msg.cpyMask(in_msg.bitMask);
+            WriteMask tmp_own := cache_entry.Owners.getOwnerMask();
+            tmp_own.invertMask();
+            tmp_msg.andMask(tmp_own);
+            if (!tmp_msg.isEmpty()) {
+                enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+                    out_msg.LineAddress := in_msg.LineAddress;
+                    out_msg.Type := CoherenceResponseType:RspOdata;
+                    out_msg.Sender := machineID;
+                    out_msg.MessageSize := MessageSizeType:Response_Control;
+                    out_msg.Destination.add(in_msg.Requestor);
+                    out_msg.bitMask.cpyMask(tmp_msg);
+                    out_msg.DataBlk.copyPartial(cache_entry.DataBlk, tmp_msg);
+                }
+            }
+        } 
+    }
+
+    action(ifrod_issueFwdReqOdata, "ifrod", desc="Issue FwdReqOData to owning core(s)") {
+        peek(requestFromL1_in, RequestMsg) {
+            WriteMask tmp_msg;
+            tmp_msg.cpyMask(in_msg.bitMask);
+            WriteMask tmp_own := cache_entry.Owners.getOwnerMask();
+            tmp_msg.andMask(tmp_own); // Intersection of requested words and owned words
+
+            if (!tmp_msg.isEmpty()) {
+                enqueue(requestToCore_out, RequestMsg, l2_response_latency) {
+                    out_msg.LineAddress := in_msg.LineAddress;
+                    out_msg.Type := CoherenceRequestType:FwdReqOdata;
+                    out_msg.Requestor := in_msg.Requestor;
+                    out_msg.MessageSize := MessageSizeType:Request_Control;
+                    /* TODO for now we send this message to all cores that own this line
+                     * even if some of those cores don't own the requested data.  This
+                     * is functionally correct but can be optimized in the future */
+                    out_msg.Destination.addNetDest(cache_entry.Owners.getOwnerNetDest());
+                    out_msg.bitMask.cpyMask(tmp_msg);
+                    out_msg.OwnerInfo.cpyVec(cache_entry.Owners);
+                }
+            }
+        }
+    }
+
+    action(rspwb_respondWB1, "rspwb1", desc="Send RspWB for the requested words, if line not in owned state") {
+        peek(requestFromL1_in, RequestMsg) {
+            enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+                out_msg.LineAddress := in_msg.LineAddress;
+                out_msg.Type := CoherenceResponseType:RspWB;
+                out_msg.Sender := machineID;
+                out_msg.MessageSize := MessageSizeType:Response_Control;
+                out_msg.Destination.add(in_msg.Requestor);
+
+                // Note: Implicit WB1 with empty bitMask 
+                out_msg.bitMask.clear(); 
+            }
+        }
+    }
+
+    action(rspwb_respondWB2, "rspwb2", desc="Send complete WB ack to requestor") {
+        DPRINTF(RubySlicc, "RspWB2 for 0x%x\n", address);
+        peek(requestFromL1_in, RequestMsg) {
+            enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+                out_msg.LineAddress := in_msg.LineAddress;
+                out_msg.Type := CoherenceResponseType:RspWB;
+                out_msg.Sender := machineID;
+                out_msg.MessageSize := MessageSizeType:Response_Control;
+                out_msg.Destination.add(in_msg.Requestor);
+                // Note: Bitmask for requested and owned according to Dir
+                out_msg.bitMask := cache_entry.Owners.getOwnerMask(in_msg.Requestor, in_msg.bitMask);
+            }
+        }
+    }
+
+
+    action(sp_storeDone_partial, "sp", desc="Partial store for correctly owned words") {
+        peek(requestFromL1_in, RequestMsg) {
+            WriteMask tmp_mask := cache_entry.Owners.getOwnerMask(in_msg.Requestor, in_msg.bitMask); 
+            cache_entry.DataBlk.copyPartial(in_msg.DataBlk, tmp_mask);
+            cache_entry.writeMask.orMask(tmp_mask);
+            if (!tmp_mask.isEmpty()) {
+                cache_entry.Dirty := true;
+            }
+        }
+    }
+
+    action(irvko_issueRvkO, "irvko", desc="Issue RvkO to owners") {
+        enqueue(requestToCore_out, RequestMsg) {
+            out_msg.LineAddress := address;
+            out_msg.Type := CoherenceRequestType:ReqRvkO;
+            out_msg.Requestor:= machineID;
+            out_msg.Destination.addNetDest(cache_entry.Owners.getOwnerNetDest());
+
+            out_msg.MessageSize := MessageSizeType:Request_Control;
+            // TOOD this revokes ownership for the entire line, this is probably a fine optimization,
+            // but run it by Sarita
+            out_msg.bitMask.fillMask();
+
+        }
+    }
+
+    action(urspm_updateMemRspMask, "urspm", desc="Update MemRspMask") {
+        if (is_valid(tbe)) {
+            peek(requestFromL1_in, RequestMsg) {
+                tbe.RequestMask.unsetMask(in_msg.bitMask);
+            }
+        } else {
+            error("Need TBE to update MemRspMask");
+        }
+    }
+
+    action(z0_stallAndWaitL1ReqQ, "z0", desc="Recycle L1 request queue") {
+        stall_and_wait(requestFromL1_in, address); 
+    }
+
+    action(z1_stallAndWaitL1RspQ, "z1", desc="Recycle L1 response queue") {
+        stall_and_wait(responseFromL1_in, address);
+    }
+
+    action(wb_wakeUpDependents, "wb", desc="Wake-up all dependents") {
+        wakeUpAllBuffers();
+    }
+
+    action(mru_updateMRU, "mru", desc="Touch block for replacement policy") {
+        L2cache.setMRU(address);
+    }
+
+
+
+   /***************************TRANSITIONS************************************/
+
+    // Process ReqV
+
+    transition(I, ReqV, I_V) {
+        t_allocateTBE;
+        imr_issueMemRead;
+        p_popRequestFromL1;
+    }
+
+    transition({S_V, V}, ReqV) {
+        rspv_respondV_L2Hit;
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition(S, ReqV) {
+        rspv_respondV_L2Hit;
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition(CO, ReqV) {
+        rspv_respondV_partial; /* Respond all words that are in L2 */
+        ifrv_issueFwdReqV;    /* Forward req to remote cores (as needed) */
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition({I_V, I_S, I_CO, S_CO, CO_S, CO_V, SWB, OWB, S_I, WB}, ReqV) {
+        z0_stallAndWaitL1ReqQ;
+        //p_popRequestFromL1;
+    }
+
+
+    // Process ReqS
+
+    transition(I, ReqS, I_S) {
+        t_allocateTBE;
+        imr_issueMemRead;
+        p_popRequestFromL1;
+    }
+
+    transition(V, ReqS, S) {
+        rs_registerSharer;
+        rsps_respondS;
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition(S, ReqS) {
+        rs_registerSharer;
+        rsps_respondS;
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition(CO, ReqS, CO_S) {
+        rs_registerSharer;
+        ifrs_issueFwdReqS;
+        mru_updateMRU;
+        // TODO why didn't I pop here
+    }
+
+    transition({I_V, I_S, I_CO, S_CO, S_V, CO_S, CO_V, SWB, OWB, S_I, WB}, ReqS) {
+        z0_stallAndWaitL1ReqQ;
+        //p_popRequestFromL1;
+    }
+
+    
+    // Process ReqO
+
+    transition(I, ReqO, I_CO) {
+        a_allocate; /* We track ownership once we recieve the request, so we must allocate a block */
+        t_allocateTBE;
+        ro_registerOwner;
+        rspo_respondO;
+        imr_issueMemRead;
+        p_popRequestFromL1;
+    }
+
+    transition(V, ReqO, CO) {
+        ro_registerOwner;
+        rspo_respondO;
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition(S, ReqO, S_CO) {
+        t_allocateTBE;
+        iinvs_issueInvS;
+        ro_registerOwner; // The registered owners shouldn't be examined/used for decisions unless the line state is CO (so this should be safe)
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition(CO, ReqO) {
+        ifro_issueFwdReqO; // Must be before updating owner so request is sent to the right core.
+        rspo_respondO_partial;
+        mru_updateMRU;
+        ro_registerOwner;
+        p_popRequestFromL1;
+    }
+
+    // TODO double check this final state with John 
+    transition(I_V, ReqO, I_CO) {
+        ro_registerOwner;
+        rspo_respondO;
+        p_popRequestFromL1;
+    }
+
+    transition({I_S, I_CO, S_CO, S_V, CO_S, CO_V, SWB, OWB, S_I, WB}, ReqO) {
+        z0_stallAndWaitL1ReqQ;
+        //p_popRequestFromL1;
+    }
+
+    // Process ReqWT
+
+    transition(I, ReqWT, V) {
+        t_allocateTBE;
+        imr_issueMemRead;
+        s_storeDone;
+        rspo_respondO;
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition(V, ReqWT) {
+        s_storeDone;
+        rspo_respondO;
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition(S, ReqWT, S_V) {
+        t_allocateTBE;
+        iinvs_issueInvS; // TODO insure that iinv_issueInv sets TBE values for #acks, state, etc.
+        p_popRequestFromL1;
+    }
+
+    /* NOTE ReqWT_LO will be triggered if the WT is for the last of the owned words */
+
+    // Words may or may not be core owned, not last owned so no downgrade
+    transition(CO, ReqWT) {
+        s_storeDone;
+        ifro_issueFwdReqO;      /* FwdReqO to owners */
+        do_deregisterOwner;     /* Deregister current owner */ 
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition(CO, ReqWT_LO, V) {
+        s_storeDone;
+        ifro_issueFwdReqO;      /* FwdReqO to owners */
+        do_deregisterOwner;     /* Deregister current owner */ 
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition(I_V, ReqWT) {
+        rspo_respondO;
+        urspm_updateMemRspMask;
+        p_popRequestFromL1;
+    }
+
+    transition({I_S, I_CO, S_CO, S_V, CO_S, CO_V, SWB, OWB, S_I, WB}, ReqWT) {
+        z0_stallAndWaitL1ReqQ;
+        //p_popRequestFromL1;
+    }
+
+    
+    // Process ReqOdata
+
+    transition(I, ReqOdata, I_CO) {
+        t_allocateTBE;
+        mtd_markTBEData;
+        ro_registerOwner; // The registered owners shouldn't be examined/used for decisions unless the line state is CO (so this should be safe)
+        imr_issueMemRead;
+        p_popRequestFromL1;
+    }
+
+    transition(V, ReqOdata, CO) {
+        ro_registerOwner;
+        rspod_respondOdata;
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition(S, ReqOdata, S_CO) {
+        t_allocateTBE;
+        mtd_markTBEData;
+        iinvs_issueInvS;
+        ro_registerOwner;
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition(CO, ReqOdata) {
+        ifrod_issueFwdReqOdata; // Must be before updating owner so request is sent to the right core
+        rspodp_respondOdata_partial;
+        ro_registerOwner;
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition({I_V, I_S, I_CO, S_CO, S_V, CO_S, CO_V, SWB, OWB, S_I, WB}, ReqOdata) {
+        z0_stallAndWaitL1ReqQ;
+        //p_popRequestFromL1;
+    }
+
+    // Process ReqWTdata
+
+    transition(I, ReqWTdata, I_V) {
+        t_allocateTBE;
+        imr_issueMemRead;
+        p_popRequestFromL1;
+    }
+
+    transition(V, ReqWTdata) {
+        s_storeDone;
+        //rspwtd_respondWTdata;
+        rspod_respondOdata;
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition(S, ReqWTdata, S_V) {
+        t_allocateTBE;
+        iinvs_issueInvS;
+        p_popRequestFromL1;
+    }
+
+    transition(CO, ReqWTdata_LO, CO_V) {
+        do_deregisterOwner;
+        irvko_issueRvkO;
+        p_popRequestFromL1;
+    }
+
+    transition(CO, ReqWTdata) {
+        do_deregisterOwner;
+        irvko_issueRvkO;
+        p_popRequestFromL1;
+    }
+    
+    transition({I_V, I_S, I_CO, S_CO, S_V, CO_S, CO_V, SWB, OWB, S_I, WB}, ReqWTdata) {
+        z0_stallAndWaitL1ReqQ;
+        //p_popRequestFromL1;
+    }
+
+    // Process ReqWB
+    //transition(CO, ReqWB, /*??*/) {
+    //  Similarly tricky to the above.  Involves possible downgrades
+    //}
+    
+
+    // Process ReqWB_L2_partial: called if some of requested words are owned
+    /* Note: Line state only needs to update when it is a WB for the last of the
+     * owned words, which will never be the case for a ReqWB_L2_partial.
+     * Owned or not, the LLC responds with a RspWB1 for almost all states.
+     * Separate transitions for the states with differences*/
+    transition({I,V,S,I_V,I_S,I_CO,V_I,S_I,S_V,S_CO,CO_S,CO_V,OWB,SWB,WB}, ReqWB_L2_partial) {
+        sp_storeDone_partial;
+        rspwb_respondWB1;
+        ds_deregisterSelf;
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition(CO, ReqWB_L2_partial) {
+        sp_storeDone_partial;
+        rspwb_respondWB2;
+        ds_deregisterSelf;
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    // Process ReqWB_L2_LO: called if WB for last owned words, implicit correct owner
+    transition(CO, ReqWB_L2_LO, V) {
+        s_storeDone;
+        rspwb_respondWB2;
+        ds_deregisterSelf;
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition(CO_S, ReqWB_L2_LO, S) {
+        s_storeDone;
+        rspwb_respondWB1;
+        ds_deregisterSelf;
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition(CO_V, ReqWB_L2_LO, V) {
+        s_storeDone;
+        rspwb_respondWB1;
+        ds_deregisterSelf;
+        mru_updateMRU;
+        p_popRequestFromL1;
+        wb_wakeUpDependents;
+    }
+
+    transition(OWB, ReqWB_L2_LO, WB) {
+        s_storeDone;
+        rspwb_respondWB1;
+        ds_deregisterSelf;
+        imw_issueMemWrite;
+        // TODO do I need to make a TBE here?
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    transition(I_CO, ReqWB_L2_LO, I_V) {
+        s_storeDone;
+        rspwb_respondWB2;
+        mru_updateMRU;
+        p_popRequestFromL1;
+    }
+
+    // Process L2 Repl
+    //transition(I, Repl) {
+    //    // Shouldn't happen, do nothing
+    //    // Double check with John about the state table
+    //} 
+
+    transition(V, Repl, I) {
+        // Do nothing 
+        ic_invCache;
+    }
+
+    transition(V, Repl_dirty, WB) {
+        imw_issueMemWrite;
+        mru_updateMRU;
+        //p_popRequestFromL1;
+    }
+
+    // TODO State table says S_V, but I believe that to be wrong
+    // Check with john
+    transition(S, Repl, S_I) {
+        t_allocateTBE;
+        iinvs_issueInvS; 
+        //p_popRequestFromL1;
+    }
+
+    transition(S, Repl_dirty, SWB) {
+        t_allocateTBE;
+        iinvs_issueInvS;
+        imw_issueMemWrite;
+        mru_updateMRU;
+        //p_popRequestFromL1;
+    }
+
+    transition(CO, {Repl, Repl_dirty}, OWB) {
+        irvko_issueRvkO;
+        mru_updateMRU;
+        //p_popRequestFromL1;
+    }
+
+
+    transition({I_V, I_S, I_CO, S_CO, S_V, CO_S, CO_V}, {Repl, Repl_dirty}) {
+        z0_stallAndWaitL1ReqQ;
+        //p_popRequestFromL1;
+    }
+
+    // Process AckS
+    transition({S_CO,S_V,SWB,S_I}, AckS) {
+        // TODO check TBE
+        dp_decrementPendingMsgs;
+        ds_deregisterSharer;
+        p_popResponseFromL1;
+    }
+
+    transition(S_CO, AckS_LS, CO) {
+        // Note: owner updated at the time of the initial req
+        dp_decrementPendingMsgs;
+        ds_deregisterSharer;
+        rspom_respondO_mixed;
+        mru_updateMRU;
+        d_deallocateTBE;
+        p_popResponseFromL1;
+    }
+
+    transition(S_V, AckS_LS, V) {
+        dp_decrementPendingMsgs;
+        ds_deregisterSharer;
+        rspod_respondOdata;
+        d_deallocateTBE;
+        p_popResponseFromL1;
+        wb_wakeUpDependents;
+    }
+
+    transition(SWB, AckS_LS, WB) {
+        dp_decrementPendingMsgs;
+        ds_deregisterSharer;
+        d_deallocateTBE;
+        p_popResponseFromL1;
+    }
+
+
+    // Process RspRvkO
+
+    transition(CO_S, RspRvkO, S) {
+        rsps_respondS;
+        p_popResponseFromL1;
+        wb_wakeUpDependents;
+    }
+
+    transition(OWB, RspRvkO, WB) {
+        // TODO ensure I don't need a TBE here
+        imw_issueMemWrite;
+        p_popResponseFromL1;
+    }
+
+    transition(CO_V, RspRvkO) {
+        s_storeDone;
+        ds_deregisterSelf;
+        p_popResponseFromL1;
+    }
+
+    transition(CO_V, RspRvkO_LO, V) {
+        s_storeDone;
+        ds_deregisterSelf;
+        rspod_respondOdata;
+        p_popResponseFromL1;
+        wb_wakeUpDependents;
+    }
+
+
+    // Process MemLoadRsp
+    transition(I_V, RspMemData, V) {
+        a_allocate;
+        l_loadDone;
+        rspv_respondV_mem;
+        d_deallocateTBE;
+        mru_updateMRU;
+        pm_popMemQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition(I_S, RspMemData, S) {
+        a_allocate;
+        l_loadDone;
+        rsps_respondS_mem;
+        d_deallocateTBE;
+        mru_updateMRU;
+        pm_popMemQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition(I_CO, RspMemData, CO) {
+        l_loadDone;
+        rspom_respondO_mixed;
+        d_deallocateTBE;
+        mru_updateMRU;
+        pm_popMemQueue;
+        wb_wakeUpDependents;
+    }
+
+    // Process MemStoreRsp
+    transition(SWB, RspWB_Mem, S_I) {
+        pm_popMemQueue;
+    }
+
+    transition(WB, RspWB_Mem, I) {
+        // TODO do I need to trigger a call back of some sort here?
+        // StoreDone etc, or I suppose that happens earlier.  Once the req goes
+        // to memory the CPU can proceed right
+        ic_invCache;
+        pm_popMemQueue;
+    }
+
+}

@@ -58,16 +58,28 @@ class PeekStatementAST(StatementAST):
         # Declare the new "in_msg_ptr" variable
         mtid = msg_type.c_ident
         qcode = self.queue_name.var.code
-        code('''
+        if self.method == "peek_dangerous":
+            code('''
+{
+    // Declare message
+    $mtid* in_msg_ptr M5_VAR_USED;
+    in_msg_ptr = dynamic_cast<$mtid *>(($qcode).${{self.method}}());
+''')
+        else:
+            code('''
 {
     // Declare message
     [[maybe_unused]] const $mtid* in_msg_ptr;
     in_msg_ptr = dynamic_cast<const $mtid *>(($qcode).${{self.method}}());
+''')
+
+        code('''
     if (in_msg_ptr == NULL) {
         // If the cast fails, this is the wrong inport (wrong message type).
         // Throw an exception, and the caller will decide to either try a
         // different inport or punt.
-        throw RejectException();
+        panic("Wrong message type\\n");
+        //throw RejectException();
     }
 ''')
 

@@ -52,8 +52,12 @@ if env['BUILD_GPU']:
     SimObject('GPUCoalescer.py')
 SimObject('RubySystem.py')
 SimObject('Sequencer.py')
+SimObject('SpandexSequencer.py')
+SimObject('WeightedLRUReplacementPolicy.py')
 if env['BUILD_GPU']:
     SimObject('VIPERCoalescer.py')
+if env['BUILD_GPU']:
+    SimObject('DeNovoCoalescer.py')
 
 Source('CacheRecorder.cc')
 Source('DMASequencer.cc')
@@ -64,5 +68,8 @@ Source('RubyPort.cc')
 Source('RubyPortProxy.cc')
 Source('RubySystem.cc')
 Source('Sequencer.cc')
+Source('SpandexSequencer.cc')
+Source('WeightedLRUPolicy.cc')
 if env['BUILD_GPU']:
     Source('VIPERCoalescer.cc')
+    Source('DeNovoCoalescer.cc');

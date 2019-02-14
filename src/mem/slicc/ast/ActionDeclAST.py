@@ -66,6 +66,15 @@ class ActionDeclAST(DeclAST):
                 var = Var(self.symtab, "cache_entry", self.location,
                           machine.EntryType, "m_cache_entry_ptr", self.pairs)
                 self.symtab.newSymbol(var)
+            
+            if machine.WordProtocol:
+                write_mask_type = self.symtab.find("WriteMask", Type)
+                if write_mask_type is not None:
+                    var = Var(self.symtab, "action_mask", self.location,
+                            write_mask_type, "action_mask", self.pairs)
+                    self.symtab.newSymbol(var)
+                else:
+                    self.error("WriteMask is required for Word based protocol")
 
             # Do not allows returns in actions
             code = self.slicc.codeFormatter()

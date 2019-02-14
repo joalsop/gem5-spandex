@@ -1,0 +1,7 @@
+protocol "Spandex";
+include "RubySlicc_interfaces.slicc";
+include "DeNovo-msg.sm";
+include "Loopback-dma.sm";
+include "Loopback-ICache.sm";
+include "Spandex-L1.sm";
+include "Spandex-L2.sm";

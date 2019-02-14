@@ -55,8 +55,10 @@ python_class_map = {
                     "WireBuffer": "RubyWireBuffer",
                     "Sequencer": "RubySequencer",
                     "HTMSequencer": "RubyHTMSequencer",
+                    "SpandexSequencer": "SpandexSequencer",
                     "GPUCoalescer" : "RubyGPUCoalescer",
                     "VIPERCoalescer" : "VIPERCoalescer",
+                    "DeNovoCoalescer": "DeNovoCoalescer",
                     "DirectoryMemory": "RubyDirectoryMemory",
                     "PerfectCacheMemory": "RubyPerfectCacheMemory",
                     "MemoryControl": "MemoryControl",
@@ -105,6 +107,7 @@ class StateMachine(Symbol):
         self.objects = []
         self.TBEType   = None
         self.EntryType = None
+        self.WordProtocol = False
         self.debug_flags = set()
         self.debug_flags.add('RubyGenerated')
         self.debug_flags.add('RubySlicc')
@@ -167,6 +170,9 @@ class StateMachine(Symbol):
                 self.error("Multiple Transaction Buffer types in a " \
                            "single machine.");
             self.TBEType = type
+
+        elif type_ident == "StateVec":
+            self.WordProtocol = True
 
         elif "interface" in type and "AbstractCacheEntry" == type["interface"]:
             if "main" in type and "false" == type["main"].lower():
@@ -350,23 +356,47 @@ private:
                 code('${{param.type_ast.type}}* m_${{param.ident}}_ptr;')
             else:
                 code('${{param.type_ast.type}} m_${{param.ident}};')
+        if self.WordProtocol:
+            code('''
+TransitionResult doTransitionLine(${ident}_Event event,
+                              ${{self.EntryType.c_ident}}* m_cache_entry_ptr,
+                              ${{self.TBEType.c_ident}}* m_tbe_ptr,
+                              Addr addr,
+                              WriteMask transitionMask,
+                              bool prechecked = false);
 
-        code('''
+TransitionResult doTransitionLineChecker(${ident}_Event event,
+                                         ${{self.EntryType.c_ident}}* m_cache_entry_ptr,
+                                         ${{self.TBEType.c_ident}}* m_tbe_ptr,
+                                         Addr lineAddr,
+                                         WriteMask transitionMask);
+
+TransitionResult doTransitionChecker(${ident}_Event event,
+                                    ${ident}_State state,
+                                    ${ident}_State& next_state,
+                                    ${{self.TBEType.c_ident}}*& m_tbe_ptr,
+                                    ${{self.EntryType.c_ident}}*& m_cache_entry_ptr,
+                                    Addr addr);
+
+''')
+        if not self.WordProtocol:
+            code('''
 TransitionResult doTransition(${ident}_Event event,
 ''')
 
-        if self.EntryType != None:
-            code('''
+            if self.EntryType != None:
+                code('''
                               ${{self.EntryType.c_ident}}* m_cache_entry_ptr,
 ''')
-        if self.TBEType != None:
-            code('''
+            if self.TBEType != None:
+                code('''
                               ${{self.TBEType.c_ident}}* m_tbe_ptr,
 ''')
 
-        code('''
+            code('''
                               Addr addr);
-
+''')
+        code('''
 TransitionResult doTransitionWorker(${ident}_Event event,
                                     ${ident}_State state,
                                     ${ident}_State& next_state,
@@ -380,7 +410,10 @@ TransitionResult doTransitionWorker(${ident}_Event event,
             code('''
                                     ${{self.EntryType.c_ident}}*& m_cache_entry_ptr,
 ''')
-
+        if self.WordProtocol:
+            code('''
+                                    WriteMask action_mask,
+''')
         code('''
                                     Addr addr);
 
@@ -427,8 +460,14 @@ void unset_tbe(${{self.TBEType.c_ident}}*& m_tbe_ptr);
 
 // Actions
 ''')
-        if self.TBEType != None and self.EntryType != None:
-            for action in self.actions.values():
+        if self.TBEType != None and self.EntryType != None and self.WordProtocol:
+            for action in self.actions.itervalues():
+                code('/** \\brief ${{action.desc}} */')
+                code('void ${{action.ident}}(${{self.TBEType.c_ident}}*& '
+                     'm_tbe_ptr, ${{self.EntryType.c_ident}}*& '
+                     'm_cache_entry_ptr, Addr addr, WriteMask action_mask);')
+        elif self.TBEType != None and self.EntryType != None:
+            for action in self.actions.itervalues():
                 code('/** \\brief ${{action.desc}} */')
                 code('void ${{action.ident}}(${{self.TBEType.c_ident}}*& '
                      'm_tbe_ptr, ${{self.EntryType.c_ident}}*& '
@@ -586,7 +625,8 @@ $c_ident::$c_ident(const Params &p)
 
             if re.compile("sequencer").search(param.ident) or \
                    param.type_ast.type.c_ident == "GPUCoalescer" or \
-                   param.type_ast.type.c_ident == "VIPERCoalescer":
+                   param.type_ast.type.c_ident == "VIPERCoalescer" or \
+                   param.type_ast.type.c_ident == "DeNovoCoalescer":
                 code('''
 if (m_${{param.ident}}_ptr != NULL) {
     m_${{param.ident}}_ptr->setController(this);
@@ -1082,11 +1122,31 @@ $c_ident::recordCacheTrace(int cntrl, CacheRecorder* tr)
 
 // Actions
 ''')
-        if self.TBEType != None and self.EntryType != None:
-            for action in self.actions.values():
+        if self.TBEType != None and self.EntryType != None and self.WordProtocol:
+            for action in self.actions.itervalues():
                 if "c_code" not in action:
                  continue
 
+                code('''
+/** \\brief ${{action.desc}} */
+void
+$c_ident::${{action.ident}}(${{self.TBEType.c_ident}}*& m_tbe_ptr, ${{self.EntryType.c_ident}}*& m_cache_entry_ptr, Addr addr, WriteMask action_mask)
+{
+    DPRINTF(RubyGenerated, "executing ${{action.ident}}\\n");
+    try {
+       ${{action["c_code"]}}
+    } catch (const RejectException & e) {
+       fatal("Error in action ${{ident}}:${{action.ident}}: "
+             "executed a peek statement with the wrong message "
+             "type specified. ");
+    }
+}
+
+''')
+        elif self.TBEType != None and self.EntryType != None:
+            for action in self.actions.itervalues():
+                if "c_code" not in action:
+                    continue
                 code('''
 /** \\brief ${{action.desc}} */
 void
@@ -1321,6 +1381,7 @@ ${ident}_Controller::wakeup()
                 code.dedent()
                 code('''
             } catch (const RejectException & e) {
+                DPRINTF(RubySlicc, "Rejection for port $port\\n");
                 rejected[${{port_to_buf_map[port]}}]++;
             }
 ''')
@@ -1368,6 +1429,7 @@ ${ident}_Controller::wakeup()
 // ${ident}: ${{self.short}}
 
 #include <cassert>
+#include <set>
 
 #include "base/logging.hh"
 #include "base/trace.hh"
@@ -1390,33 +1452,36 @@ namespace gem5
 namespace ruby
 {
 
+''')
+        if not self.WordProtocol:
+            code('''
 TransitionResult
 ${ident}_Controller::doTransition(${ident}_Event event,
 ''')
-        if self.EntryType != None:
-            code('''
+            if self.EntryType != None:
+                code('''
                                   ${{self.EntryType.c_ident}}* m_cache_entry_ptr,
 ''')
-        if self.TBEType != None:
-            code('''
+            if self.TBEType != None:
+                code('''
                                   ${{self.TBEType.c_ident}}* m_tbe_ptr,
 ''')
-        code('''
+            code('''
                                   Addr addr)
 {
 ''')
-        code.indent()
+            code.indent()
 
-        if self.TBEType != None and self.EntryType != None:
-            code('${ident}_State state = getState(m_tbe_ptr, m_cache_entry_ptr, addr);')
-        elif self.TBEType != None:
-            code('${ident}_State state = getState(m_tbe_ptr, addr);')
-        elif self.EntryType != None:
-            code('${ident}_State state = getState(m_cache_entry_ptr, addr);')
-        else:
-            code('${ident}_State state = getState(addr);')
+            if self.TBEType != None and self.EntryType != None:
+                code('${ident}_State state = getState(m_tbe_ptr, m_cache_entry_ptr, addr);')
+            elif self.TBEType != None:
+                code('${ident}_State state = getState(m_tbe_ptr, addr);')
+            elif self.EntryType != None:
+                code('${ident}_State state = getState(m_cache_entry_ptr, addr);')
+            else:
+                code('${ident}_State state = getState(addr);')
 
-        code('''
+            code('''
 ${ident}_State next_state = state;
 
 DPRINTF(RubyGenerated, "%s, Time: %lld, state: %s, event: %s, addr: %#x\\n",
@@ -1425,18 +1490,18 @@ DPRINTF(RubyGenerated, "%s, Time: %lld, state: %s, event: %s, addr: %#x\\n",
 
 TransitionResult result =
 ''')
-        if self.TBEType != None and self.EntryType != None:
-            code('doTransitionWorker(event, state, next_state, m_tbe_ptr, m_cache_entry_ptr, addr);')
-        elif self.TBEType != None:
-            code('doTransitionWorker(event, state, next_state, m_tbe_ptr, addr);')
-        elif self.EntryType != None:
-            code('doTransitionWorker(event, state, next_state, m_cache_entry_ptr, addr);')
-        else:
-            code('doTransitionWorker(event, state, next_state, addr);')
+            if self.TBEType != None and self.EntryType != None:
+                code('doTransitionWorker(event, state, next_state, m_tbe_ptr, m_cache_entry_ptr, addr);')
+            elif self.TBEType != None:
+                code('doTransitionWorker(event, state, next_state, m_tbe_ptr, addr);')
+            elif self.EntryType != None:
+                code('doTransitionWorker(event, state, next_state, m_cache_entry_ptr, addr);')
+            else:
+                code('doTransitionWorker(event, state, next_state, addr);')
 
-        port_to_buf_map, in_msg_bufs, msg_bufs = self.getBufferMaps(ident)
+            port_to_buf_map, in_msg_bufs, msg_bufs = self.getBufferMaps(ident)
 
-        code('''
+            code('''
 
 if (result == TransitionResult_Valid) {
     DPRINTF(RubyGenerated, "next_state: %s\\n",
@@ -1452,20 +1517,20 @@ if (result == TransitionResult_Valid) {
 
     CLEAR_TRANSITION_COMMENT();
 ''')
-        if self.TBEType != None and self.EntryType != None:
-            code('setState(m_tbe_ptr, m_cache_entry_ptr, addr, next_state);')
-            code('setAccessPermission(m_cache_entry_ptr, addr, next_state);')
-        elif self.TBEType != None:
-            code('setState(m_tbe_ptr, addr, next_state);')
-            code('setAccessPermission(addr, next_state);')
-        elif self.EntryType != None:
-            code('setState(m_cache_entry_ptr, addr, next_state);')
-            code('setAccessPermission(m_cache_entry_ptr, addr, next_state);')
-        else:
-            code('setState(addr, next_state);')
-            code('setAccessPermission(addr, next_state);')
+            if self.TBEType != None and self.EntryType != None:
+                code('setState(m_tbe_ptr, m_cache_entry_ptr, addr, next_state);')
+                code('setAccessPermission(m_cache_entry_ptr, addr, next_state);')
+            elif self.TBEType != None:
+                code('setState(m_tbe_ptr, addr, next_state);')
+                code('setAccessPermission(addr, next_state);')
+            elif self.EntryType != None:
+                code('setState(m_cache_entry_ptr, addr, next_state);')
+                code('setAccessPermission(m_cache_entry_ptr, addr, next_state);')
+            else:
+                code('setState(addr, next_state);')
+                code('setAccessPermission(addr, next_state);')
 
-        code('''
+            code('''
 } else if (result == TransitionResult_ResourceStall) {
     DPRINTFR(ProtocolTrace, "%15s %3s %10s%20s %6s>%-6s %#x %s\\n",
              curTick(), m_version, "${ident}",
@@ -1485,9 +1550,11 @@ if (result == TransitionResult_Valid) {
 
 return result;
 ''')
-        code.dedent()
-        code('''
+            code.dedent()
+            code('''
 }
+''')
+        code('''
 
 TransitionResult
 ${ident}_Controller::doTransitionWorker(${ident}_Event event,
@@ -1500,8 +1567,12 @@ ${ident}_Controller::doTransitionWorker(${ident}_Event event,
                                         ${{self.TBEType.c_ident}}*& m_tbe_ptr,
 ''')
         if self.EntryType != None:
-                  code('''
+            code('''
                                         ${{self.EntryType.c_ident}}*& m_cache_entry_ptr,
+''')
+        if self.WordProtocol:
+            code('''
+                                        WriteMask action_mask,
 ''')
         code('''
                                         Addr addr)
@@ -1577,7 +1648,10 @@ if (!checkResourceAvailable(%s_RequestType_%s, addr)) {
             if stall:
                 case('return TransitionResult_ProtocolStall;')
             else:
-                if self.TBEType != None and self.EntryType != None:
+                if self.TBEType != None and self.EntryType != None and self.WordProtocol:
+                    for action in actions:
+                        case('${{action.ident}}(m_tbe_ptr, m_cache_entry_ptr, addr, action_mask);')
+                elif self.TBEType != None and self.EntryType != None:
                     for action in actions:
                         case('${{action.ident}}(m_tbe_ptr, m_cache_entry_ptr, addr);')
                 elif self.TBEType != None:
@@ -1614,12 +1688,273 @@ if (!checkResourceAvailable(%s_RequestType_%s, addr)) {
               "%s time: %d addr: %#x event: %s state: %s\\n",
               name(), curCycle(), addr, event, state);
     }
+''')
+#        if self.WordProtocol:
+#            code('''
+#        } // close action_mask if
+#        addr += BYTES_PER_WORD;
+#    } // close action_mask for
+#''')
+        code('''
+    return TransitionResult_Valid;
+}
+''')
+
+        if self.WordProtocol:
+            code('''
+TransitionResult
+${ident}_Controller::doTransitionChecker(${ident}_Event event,
+                                        ${ident}_State state,
+                                        ${ident}_State& next_state,
+                                        ${{self.TBEType.c_ident}}*& m_tbe_ptr,
+                                        ${{self.EntryType.c_ident}}*& m_cache_entry_ptr,
+                                        Addr addr)
+{
+    switch(HASH_FUN(state, event)) {
+''')
+
+            # This map will allow suppress generating duplicate code
+            cases = orderdict()
+
+            for trans in self.transitions:
+                case_string = "%s_State_%s, %s_Event_%s" % \
+                    (self.ident, trans.state.ident, self.ident, trans.event.ident)
+
+                case = self.symtab.codeFormatter()
+                # Silance state transitions
+                # if trans.state != trans.nextState:
+                    # if trans.nextState.isWildcard():
+                    #     # When * is encountered as an end state of a transition,
+                    #     # the next state is determined by calling the
+                    #     # machine-specific getNextState function. The next state
+                    #     # is determined before any actions of the transition
+                    #     # execute, and therefore the next state calculation cannot
+                    #     # depend on any of the transitionactions.
+                    #     case('next_state = getNextState(addr);')
+                    # else:
+                    #     ns_ident = trans.nextState.ident
+                    #     case('next_state = ${ident}_State_${ns_ident};')
+
+                actions = trans.actions
+                request_types = trans.request_types
+
+                # Check for resources
+                case_sorter = []
+                res = trans.resources
+                for key,val in res.iteritems():
+                    val = '''
+if (!%s.areNSlotsAvailable(%s, clockEdge()))
+    return TransitionResult_ResourceStall;
+''' % (key.code, val)
+                    case_sorter.append(val)
+
+                # Check all of the request_types for resource constraints
+                for request_type in request_types:
+                    val = '''
+if (!checkResourceAvailable(%s_RequestType_%s, addr)) {
+    return TransitionResult_ResourceStall;
+}
+''' % (self.ident, request_type.ident)
+                    case_sorter.append(val)
+
+                # Emit the code sequences in a sorted order.  This makes the
+                # output deterministic (without this the output order can vary
+                # since Map's keys() on a vector of pointers is not deterministic
+                for c in sorted(case_sorter):
+                    case("$c")
+
+                # Record access types for this transition
+                for request_type in request_types:
+                    case('recordRequestType(${ident}_RequestType_${{request_type.ident}}, addr);')
+
+
+                # Figure out if we stall
+                stall = False
+                for action in actions:
+                    if action.ident == "z_stall":
+                        stall = True
+                        break
+
+                if stall:
+                    case('return TransitionResult_ProtocolStall;')
+                # Silence all actions for transitionChecker
+                else:
+                #     if self.TBEType != None and self.EntryType != None:
+                #         for action in actions:
+                #             case('${{action.ident}}(m_tbe_ptr, m_cache_entry_ptr, addr);')
+                #     elif self.TBEType != None:
+                #         for action in actions:
+                #             case('${{action.ident}}(m_tbe_ptr, addr);')
+                #     elif self.EntryType != None:
+                #         for action in actions:
+                #             case('${{action.ident}}(m_cache_entry_ptr, addr);')
+                #     else:
+                #         for action in actions:
+                #             case('${{action.ident}}(addr);')
+                    case('return TransitionResult_Valid;')
+
+                case = str(case)
+
+                # Look to see if this transition code is unique.
+                if case not in cases:
+                    cases[case] = []
+
+                cases[case].append(case_string)
+
+            # Walk through all of the unique code blocks and spit out the
+            # corresponding case statement elements
+            for case,transitions in cases.iteritems():
+                # Iterative over all the multiple transitions that share
+                # the same code
+                for trans in transitions:
+                    code('  case HASH_FUN($trans):')
+                code('    $case\n')
+
+            code('''
+      default:
+        panic("Invalid transition\\n"
+              "%s time: %d addr: %#x event: %s state: %s\\n",
+              name(), curCycle(), addr, event, state);
+    }
 
     return TransitionResult_Valid;
 }
 
 } // namespace ruby
 } // namespace gem5
+''')
+        if self.WordProtocol:
+            # TODO: remove transres
+            code('''
+/*
+If the argument prechecked is set {
+    Precondition: TransitionLineChecker returned TransitionResult_Valid on the same arguments
+    Postcondition: this will return TransitionResult_Valid
+}
+*/
+TransitionResult
+${ident}_Controller::doTransitionLine(${ident}_Event event,
+                                      ${{self.EntryType.c_ident}}* m_cache_entry_ptr,
+                                      ${{self.TBEType.c_ident}}* m_tbe_ptr,
+                                      Addr lineAddr,
+                                      WriteMask transitionMask,
+                                      bool prechecked)
+{
+    Addr physAddr = lineAddr;
+    std::set<${ident}_State> state_set;
+    std::map<${ident}_State, WriteMask> action_map;
+    std::map<${ident}_State, TransitionResult> transres_map;
+
+    // Build a word mask of each state present
+    for (int i = 0; i< transitionMask.getSize(); i+=BYTES_PER_WORD) {
+
+        ${ident}_State state = getState(m_tbe_ptr, m_cache_entry_ptr, physAddr);
+        if (transitionMask.getMask(i, BYTES_PER_WORD) && (state_set.count(state) == 0)) {
+
+            WriteMask action_mask;
+            Addr test_physAddr = lineAddr;
+            for (int j = 0; j < transitionMask.getSize(); j += BYTES_PER_WORD) {
+
+                ${ident}_State test_state = getState(m_tbe_ptr, m_cache_entry_ptr, test_physAddr);
+                if (transitionMask.getMask(j, BYTES_PER_WORD) && (test_state == state)) {
+
+                    action_mask.setMask(j, BYTES_PER_WORD);
+
+                }
+
+                test_physAddr += BYTES_PER_WORD;
+            }
+            action_map[state] = action_mask;
+            state_set.insert(state);
+        }
+        physAddr += BYTES_PER_WORD;
+    }
+
+    if (!prechecked) {
+        physAddr = lineAddr;
+        // Check transitions are valid
+        for (auto it = state_set.begin(); it != state_set.end(); it++) {
+            ${ident}_State state = *it;
+            ${ident}_State next_state = state;
+            // doTransitionChecker takes a physAddr, but only uses state to determine stalls
+            // so we only need to check for the present states
+            transres_map[state] = doTransitionChecker(event, state, next_state, m_tbe_ptr, m_cache_entry_ptr, physAddr);
+        }
+    }
+
+    physAddr = lineAddr;
+    // Trigger actions
+    for (int i = 0; i< transitionMask.getSize(); i+= BYTES_PER_WORD) {
+        ${ident}_State state = getState(m_tbe_ptr, m_cache_entry_ptr, physAddr);
+        ${ident}_State next_state = state;
+
+        if (transitionMask.getMask(i, BYTES_PER_WORD) && (prechecked || transres_map[state] == TransitionResult_Valid)) {
+            TransitionResult result =
+                doTransitionWorker(event, state, next_state, m_tbe_ptr, m_cache_entry_ptr, action_map[state], physAddr);
+
+            if (result == TransitionResult_Valid) {
+                DPRINTF(RubyGenerated, "next_state: %s\\n",
+                        ${ident}_State_to_string(next_state));
+
+                countTransition(state, event);
+
+                DPRINTFR(ProtocolTrace, "%15d %3s %10s%20s %6s>%-6s %#x %s\\n",
+                         curTick(), m_version, "${ident}",
+                         ${ident}_Event_to_string(event),
+                         ${ident}_State_to_string(state),
+                         ${ident}_State_to_string(next_state),
+                         printAddress(physAddr), GET_TRANSITION_COMMENT());
+
+                CLEAR_TRANSITION_COMMENT();
+                setState(m_tbe_ptr, m_cache_entry_ptr, physAddr, next_state);
+                setAccessPermission(m_cache_entry_ptr, physAddr, next_state);
+            } else {
+                panic("Unexpected transition result\\n"
+                      "%s time: %d addr: %#x event: %s state: %s, result:%s\\n",
+                       name(), curCycle(), physAddr, event, state, result);
+            }
+        }
+        physAddr += BYTES_PER_WORD;
+    }
+
+    if (!prechecked) {
+        // Return appropriate transition result
+        for (auto it = transres_map.begin(); it != transres_map.end(); it++) {
+            if (it->second != TransitionResult_Valid) {
+                return it->second;
+            }
+        }
+    }
+    return TransitionResult_Valid;
+}
+
+TransitionResult
+${ident}_Controller::doTransitionLineChecker(${ident}_Event event,
+                                             ${{self.EntryType.c_ident}}* m_cache_entry_ptr,
+                                             ${{self.TBEType.c_ident}}* m_tbe_ptr,
+                                             Addr lineAddr,
+                                             WriteMask transitionMask)
+{
+    std::set<${ident}_State> state_set;
+
+    Addr physAddr = lineAddr;
+    // Build a word mask of each state present
+    for (int i = 0; i< transitionMask.getSize(); i+=BYTES_PER_WORD, physAddr += BYTES_PER_WORD) {
+        ${ident}_State state = getState(m_tbe_ptr, m_cache_entry_ptr, physAddr);
+        if (transitionMask.getMask(i, BYTES_PER_WORD) && (state_set.count(state) == 0)) {
+            ${ident}_State next_state = state;
+            // doTransitionChecker takes a physAddr, but only uses state to determine stalls
+            // so we only need to check for the present states
+            TransitionResult result = doTransitionChecker(event, state, next_state, m_tbe_ptr, m_cache_entry_ptr, physAddr);
+            if (result != TransitionResult_Valid) {
+                return TransitionResult_ResourceStall; // doesn't matter which kind of stall
+            }
+            state_set.insert(state);
+        }
+    }
+    return TransitionResult_Valid;
+}
+
 ''')
         code.write(path, "%s_Transitions.cc" % self.ident)
 

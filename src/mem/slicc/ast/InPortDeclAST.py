@@ -78,11 +78,16 @@ class InPortDeclAST(DeclAST):
         symtab.pushFrame()
         param_types = []
 
+        # must creat a new param type list for triggerLine because of shared
+        # pointer reasons instead of using param_types
+        triggerLine_param_types = []
+
         # Check for Event
         type = symtab.find("Event", Type)
         if type is None:
             self.error("in_port decls require 'Event' enumeration defined")
         param_types.append(type)
+        triggerLine_param_types.append(type)
 
         # Check for Address
         type = symtab.find("Addr", Type)
@@ -90,11 +95,14 @@ class InPortDeclAST(DeclAST):
             self.error("in_port decls require 'Addr' type to be defined")
 
         param_types.append(type)
+        triggerLine_param_types.append(type)
 
         if machine.EntryType != None:
             param_types.append(machine.EntryType)
+            triggerLine_param_types.append(machine.EntryType)
         if machine.TBEType != None:
             param_types.append(machine.TBEType)
+            triggerLine_param_types.append(machine.TBEType)
 
         # Add the trigger method - FIXME, this is a bit dirty
         pairs = { "external" : "yes" }
@@ -104,6 +112,22 @@ class InPortDeclAST(DeclAST):
         func = Func(self.symtab, trigger_func_name, "trigger", self.location,
                     void_type, param_types, [], "", pairs)
         symtab.newSymbol(func)
+
+        # Add the triggerLine method - taken from above so `a bit dirty`
+        if machine.WordProtocol:
+            type = symtab.find("WriteMask", Type)
+            if type is None:
+                self.error("in_port decls require WriteMask to be defined")
+            triggerLine_param_types.append(type)
+
+            pairs = { "external" : "yes" }
+            triggerLine_func_name = "triggerLine"
+            for param in triggerLine_param_types:
+                triggerLine_func_name += "_" + param.ident
+            func = Func(self.symtab, triggerLine_func_name, "triggerLine",
+                    self.location, void_type, triggerLine_param_types,
+                    [], "", pairs)
+            symtab.newSymbol(func)
 
         # Add the stallPort method - this hacks reschedules the controller
         # for stalled messages that don't trigger events

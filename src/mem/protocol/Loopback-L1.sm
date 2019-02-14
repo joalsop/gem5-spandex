@@ -1,0 +1,567 @@
+machine(MachineType:L1Cache, "LoopBack L1 Cache") :
+    // Some of these are obvi not relevant, but as our old code does not use this 
+    // new gem5 style slicc, I copied with changes where obvious because I don't
+    // know what parameters are required/are presently in the infrastructure.
+    DeNovoCoalescer *coalescer;
+    SpandexSequencer *sequencer;
+    bool use_seq_not_coal;
+    CacheMemory *L1cache;
+    Cycles issue_latency := 40;
+    Cycles l2_hit_latency := 18;
+    int L2_select_num_bits;
+    MessageBuffer *mandatoryQueue;
+
+    /* Ingess */
+    MessageBuffer *responseToL1Cache, network="From", virtual_network="3", vnet_type="response";
+    //MessageBuffer *requestToL1Cache, network="From", virtual_network="1", vnet_type="request";
+
+    /* Egress */
+    //MessageBuffer *responseFromL1Cache, network="To", virtual_network="3", vnet_type="response";
+    MessageBuffer *requestFromL1Cache, network="To", virtual_network="1", vnet_type="request";
+{
+    // Used to for functions that would be static outside of SLICC
+    WriteMask static_WriteMask;
+
+    /*******************************STATES*************************************/
+    state_declaration(State, desc="Primary Cache States", default="L1Cache_State_V") {
+        /* Default state must be listed first for word granularity */
+        I, AccessPermission:Invalid, desc="Invalid, not cached";
+        V, AccessPermission:Read_Only ,desc="Valid, cached"; 
+        T, AccessPermission:Read_Only, desc="Tmp to add a delay for writebacks";
+    }
+
+    /*******************************EVENTS*************************************/
+    enumeration(Event, desc="Cache Events") {
+        Load,       desc="Load";
+        Store,      desc="Store";
+        GPUStore,      desc="Store";
+        RspV,       desc="Recieve a RspV from L2";
+        Repl,       desc="Replace block from cache";
+        Fetch,      desc="I Fetch";
+        Evict,      desc="Evict cache entry";
+        FlashLoad,  desc="Flash loopback load";
+    }
+
+    /***************************STRUCTURES & FUNCTIONS*************************/
+    structure(StateVec, external="yes", desc="...") {
+         void   setAt(int, State),      desc="...";
+         State  getAt(int),             desc="...";
+         bool   contains(State),        desc="...";
+         int    getSize(),              desc="...";
+    }
+    
+    structure(Entry, desc="...", interface="AbstractCacheEntry") {
+        StateVec WordStates,    desc="State vector for the words of a cache line";
+        bool Dirty,             desc="Is the data dirty (diff than memory)?";
+        DataBlock DataBlk,      desc="data for the block";
+        WriteMask writeMask,    desc="written bytes masks";
+    }
+
+    structure(TBE, desc="...") {
+        StateVec WordStates,    desc="Transient states";
+        DataBlock DataBlk, desc="data for the block, required for concurrent writebacks";
+        bool Dirty,        desc="Is the data dirty (different than memory)?";
+        int NumPendingMsgs,desc="Number of acks/data messages that this processor is waiting for";
+        bool Shared,       desc="Victim hit by shared probe";
+     }
+
+    structure(TBETable, external="yes", desc="...") {
+        TBE lookup(Addr), desc="...";
+        void allocate(Addr), desc="...";
+        void deallocate(Addr), desc="...";
+        bool isPresent(Addr), desc="...";
+    }
+
+    TBETable TBEs, template="<L1Cache_TBE>", constructor="m_number_of_TBEs";
+    int L2_select_low_bit, default="RubySystem::getBlockSizeBits()";
+    Cycles curCycle();
+    Tick cyclesToTicks(Cycles c);
+    void set_cache_entry(AbstractCacheEntry b);
+    void unset_cache_entry();
+    void set_tbe(TBE b);
+    void unset_tbe();
+
+    MachineID mapAddressToMachine(Addr addr, MachineType mtype);
+
+    /********************INTERNAL FUNCTIONS************************************/
+    //Taken from GPU_VIPER-TCP
+    //
+    Tick clockEdge();
+
+    Entry getCacheEntry(Addr address), return_by_pointer="yes" {
+        Entry cache_entry := static_cast(Entry, "pointer", L1cache.lookup(address));
+        if (is_valid(cache_entry)) {
+            return cache_entry;
+        }
+        cache_entry := static_cast(Entry, "pointer", L1cache.allocate(address, new Entry));
+        return cache_entry;
+    }
+
+    void functionalRead(Addr addr, Packet *pkt) {
+        TBE tbe := TBEs.lookup(addr);
+        if(is_valid(tbe)) {
+            testAndRead(addr, tbe.DataBlk, pkt);
+        } else {
+            functionalMemoryRead(pkt);
+        }
+    }
+
+    int functionalWrite(Addr addr, Packet *pkt) {
+        int num_functional_writes := 0;
+
+        TBE tbe := TBEs.lookup(addr);
+        if(is_valid(tbe)) {
+            num_functional_writes := num_functional_writes +
+                testAndWrite(addr, tbe.DataBlk, pkt);
+        }
+
+        num_functional_writes := num_functional_writes +
+            functionalMemoryWrite(pkt);
+        return num_functional_writes;
+    }
+
+    AccessPermission getAccessPermission(Addr addr) {
+    //    TBE tbe := TBEs.lookup(addr);
+    //    if(is_valid(tbe)) {
+    //        return L1Cache_State_to_permission(tbe.TBEState);
+    //    }
+
+    //    Entry cache_entry := getCacheEntry(addr);
+    //    if(is_valid(cache_entry)) {
+    //        return L1Cache_State_to_permission(cache_entry.CacheState);
+    //    }
+
+        return AccessPermission:NotPresent;
+    }
+
+    State getState(TBE tbe, Entry cache_entry, Addr addr ) {
+        int idx := static_WriteMask.getWordOffset(addr);
+        if (is_valid(cache_entry)) {
+            return static_cast(State, "state", cache_entry.WordStates.getAt(idx));
+        //} else if (is_valid(tbe)) {
+        //    return static_cast(State, "state", tbe.WordStates.getAt(idx));
+        }
+        return State:I;
+    }
+
+    ///* getState and setState will remain line granularity
+    // * for debugging purposes as well as performance reasons */
+    //State getState(TBE tbe, Entry cache_entry, Addr addr) {
+    //    //int index := L1cache.getWordIndex(addr);
+    //    if (is_valid(tbe)) {
+    //        return tbe.TBEState;
+    //    } else if (is_valid(cache_entry)) {
+    //        return cache_entry.CacheState;
+    //    }
+    //    return State:I;
+    //}
+
+    void setState(TBE tbe, Entry cache_entry, Addr addr, State state) {
+        int idx := static_WriteMask.getWordOffset(addr);
+        if (is_valid(tbe)) {
+            tbe.WordStates.setAt(idx, state);
+        }
+
+        if (is_valid(cache_entry)) {
+            cache_entry.WordStates.setAt(idx, state);
+        }
+    }
+
+    ///* getWordState and setWordState will be user called and perform
+    // * those actions at a word granularity */
+    //State getWordState(Addr addr) {
+    //    Entry cache_entry := getCacheEntry(makeLineAddress(addr)); 
+    //    int index := L1cache.getWordIndex(addr);
+    //    if (cache_entry.owned.getAt(index)) {
+    //        return State:O;
+    //    }
+    //    if (cache_entry.valid.getAt(index)) {
+    //        return State:V;
+    //    }
+    //    return State:I;
+    //}
+
+    //void setWordState(Addr addr, State state) {
+    //    Entry cache_entry := getCacheEntry(makeLineAddress(addr)); 
+    //    TBE tbe := TBEs.lookup(addr);
+    //    int index := L1cache.getWordIndex(addr);
+    //    if (state == State:O) {
+    //        /* If the line isn't owned, set owned */
+    //        if (cache_entry.CacheState != State:O) {
+    //            setState(tbe, cache_entry, addr, State:O);
+    //        }
+    //        cache_entry.owned.setAt(index, true);
+    //        cache_entry.valid.setAt(index, false);
+    //    }
+    //    if (state == State:V) {
+    //        /* Downgrade / upgrade if applicable*/
+    //        if ((cache_entry.owned.isEmpty() && cache_entry.CacheState == State:O)
+    //                || cache_entry.CacheState == State:I) {
+    //            setState(tbe, cache_entry, addr, State:V);
+    //        }
+    //        cache_entry.owned.setAt(index, false);
+    //        cache_entry.valid.setAt(index, true);
+    //    }
+    //    if (state == State:I) {
+    //        /* Downgrade if applicable */
+    //        if (cache_entry.owned.isEmpty() && cache_entry.valid.isEmpty()) {
+    //            setState(tbe, cache_entry, addr, State:I);
+    //        }
+    //        cache_entry.valid.setAt(index, false);
+    //        cache_entry.owned.setAt(index, false);
+    //    }
+
+    //}
+
+     void setAccessPermission(Entry cache_entry, Addr addr, State state) {
+    //     if (is_valid(cache_entry)) {
+    //         cache_entry.changePermission(L1Cache_State_to_permission(state));
+    //     }
+    }
+
+    /***************************IN PORT****************************************/
+    in_port(responseToL1Cache_in, ResponseMsg, responseToL1Cache, desc="Responses sent from L2, recieved by L1") {
+        if (responseToL1Cache_in.isReady(clockEdge())) {
+            peek(responseToL1Cache_in, ResponseMsg, block_on="Address") {
+                Entry cache_entry := getCacheEntry(in_msg.Address);
+                TBE tbe := TBEs.lookup(in_msg.Address);
+                if (in_msg.Type == CoherenceResponseType:RspV) {
+                    // If addr is still in cache or avail
+                    if (is_valid(cache_entry) || L1cache.cacheAvail(in_msg.Address)) {
+                        //if (!use_seq_not_coal) {
+                        //    DPRINTF(WHD, "GPU RspV: %s, %s\n",in_msg, in_msg.bitMask);
+                        //}
+                        triggerLine(Event:RspV, in_msg.Address, cache_entry, tbe, in_msg.bitMask);
+                    } else {
+                        /*Line*/Addr victim := L1cache.cacheProbe(in_msg.Address);
+                        triggerLine(Event:Repl, victim, getCacheEntry(victim), TBEs.lookup(victim), in_msg.bitMask);
+                    }
+                }
+            }
+        }
+    }
+
+
+    /* Lowest priority so must go at bottom */
+    in_port(mandatoryQueue_in, RubyRequest, mandatoryQueue, desc="...") {
+        if (mandatoryQueue_in.isReady(clockEdge())) {
+            peek(mandatoryQueue_in, RubyRequest, block_on="LineAddress") {
+                Entry cache_entry := getCacheEntry(in_msg.LineAddress); 
+                TBE tbe := TBEs.lookup(in_msg.LineAddress);
+                DPRINTF(RubySlicc, "%s\n", in_msg);
+                if (in_msg.Type == RubyRequestType:LD) {
+                    //if(use_seq_not_coal) {
+                        triggerLine(Event:Load, in_msg.LineAddress, cache_entry, tbe, in_msg.writeMask);
+                    //} else {
+                    //    triggerLine(Event:FlashLoad, in_msg.LineAddress, cache_entry, tbe, in_msg.writeMask);
+                    //}
+                } else if (in_msg.Type == RubyRequestType:ST) {
+                    if (!use_seq_not_coal) {
+                        DPRINTF(WHD, "GPU ST Request: %s\n",in_msg);
+                        triggerLine(Event:GPUStore, in_msg.LineAddress, cache_entry, tbe, in_msg.writeMask);
+                    } else {
+                        triggerLine(Event:Store, in_msg.LineAddress, cache_entry, tbe, in_msg.writeMask);
+                    }
+                } else if (in_msg.Type == RubyRequestType:IFETCH) {
+                    triggerLine(Event:Fetch, in_msg.LineAddress, cache_entry, tbe, in_msg.writeMask);
+                } else if (in_msg.Type == RubyRequestType:REPLACEMENT) {
+                    triggerLine(Event:Evict, in_msg.LineAddress, cache_entry, tbe, in_msg.writeMask);
+
+
+					// denovo requests
+				} else if (in_msg.Type == RubyRequestType:ST_WT) {
+					DPRINTF(RubyDeNovoRegion, "ST_WT: %s\n", in_msg);
+					// copied from RubyRequestType:ST,
+					// so that we maintain correctness
+                    if (!use_seq_not_coal) {
+                        DPRINTF(WHD, "GPU ST Request: %s\n",in_msg);
+                        triggerLine(Event:GPUStore, in_msg.LineAddress, cache_entry, tbe, in_msg.writeMask);
+                    } else {
+                        triggerLine(Event:Store, in_msg.LineAddress, cache_entry, tbe, in_msg.writeMask);
+                    }
+				} else if (true
+						   || in_msg.Type == RubyRequestType:LD_LG
+						   || in_msg.Type == RubyRequestType:LD_LGO
+						   || in_msg.Type == RubyRequestType:LD_SLGO
+						   ) {
+					DPRINTF(RubyDeNovoRegion, "Specialized LD: %s\n", in_msg.Type);
+					// copied from RubyRequestType:LD,
+					// so that we maintain correctness
+                    //if(use_seq_not_coal) {
+                        triggerLine(Event:Load, in_msg.LineAddress, cache_entry, tbe, in_msg.writeMask);
+                    //} else {
+                    //    triggerLine(Event:FlashLoad, in_msg.LineAddress, cache_entry, tbe, in_msg.writeMask);
+                    //}
+				} else if (true
+						   || in_msg.Type == RubyRequestType:ST_WT
+						   || in_msg.Type == RubyRequestType:ST_LGO
+						   ) {
+					DPRINTF(RubyDeNovoRegion, "Specialized ST: %s\n", in_msg.Type);
+					// copied from RubyRequestType:ST,
+					// so that we maintain correctness
+                    if (!use_seq_not_coal) {
+                        DPRINTF(WHD, "GPU ST Request: %s\n",in_msg);
+                        triggerLine(Event:GPUStore, in_msg.LineAddress, cache_entry, tbe, in_msg.writeMask);
+                    } else {
+                        triggerLine(Event:Store, in_msg.LineAddress, cache_entry, tbe, in_msg.writeMask);
+                    }
+
+                } else {
+                    error("Unsupported request type\n");
+                }
+            }
+        }
+    }
+
+    /***************************OUT PORT***************************************/
+    out_port(requestNetwork_out, RequestMsg, requestFromL1Cache);
+
+    /***************************ACTIONS****************************************/
+    action(l_loadDone, "l", desc="local load done") {
+        assert(is_valid(cache_entry));
+        if (use_seq_not_coal) {
+            sequencer.readCallback(address, cache_entry.DataBlk, false, MachineType:L1Cache);
+        } else {
+            DPRINTF(WHD,"LoadDone action_mask: 0x%x, %s\n",makeLineAddress(address),action_mask);
+            coalescer.readCallback(address, MachineType:L1Cache, cache_entry.DataBlk);
+        }
+    }
+
+    action(irv_issueReqV, "irv", desc="Issue ReqV") {
+        // Only issue a memory request for 1 word in the action mask
+        if (action_mask.isFirstValid(address)) {
+            peek(mandatoryQueue_in, RubyRequest) {
+                enqueue(requestNetwork_out, RequestMsg, issue_latency) {
+                    out_msg.Address := in_msg.LineAddress;
+                    out_msg.Type := CoherenceRequestType:ReqV;
+                    out_msg.Requestor := machineID;
+
+                    out_msg.Destination.add(mapAddressToMachine(address, MachineType:L2Cache));
+                    //out_msg.Destination.add(mapAddressToRange(address,
+                    //            MachineType:L2Cache, L2_select_low_bit,
+                    //            L2_select_num_bits)); 
+
+                    out_msg.MessageSize := MessageSizeType:Request_Control;
+
+                    // initially I had in_msg.writeMask here, but we don't want
+                    // to req the full CE req, just the action mask
+                    out_msg.bitMask.cpyMask(action_mask);
+
+                    out_msg.ReqIssue := curCycle();
+                }
+            }
+        }
+    }
+
+    action(s_storeDone, "s", desc="local store done") {
+        assert(is_valid(cache_entry));
+                    //if (!use_seq_not_coal) {
+                    //    DPRINTF(WHD, "GPU Store Done: %x, %s\n",address,action_mask);
+                    //}
+        // if (action_mask.isFirstValid(address)) {
+            if (use_seq_not_coal) {
+                sequencer.writeCallback(address, cache_entry.DataBlk, false, MachineType:L1Cache);
+            } else {
+                coalescer.writeCallback(address, MachineType:L1Cache, cache_entry.DataBlk);
+            }
+     //   }
+    }
+
+    action(s_storeDataCopy, "sdc", desc="copy appropriate data to the cache entry") {
+        assert(is_valid(cache_entry));
+        if (action_mask.isFirstValid(address)) {
+                    //if (!use_seq_not_coal) {
+                    //    DPRINTF(WHD, "GPU Store Data Copy: %x, %s\n",address,action_mask);
+                    //}
+            peek(mandatoryQueue_in, RubyRequest) {
+                // Copy back ready data even if it's not a full request
+                // Request will be coalesced in the coalescer
+                cache_entry.DataBlk.copyPartial(in_msg.WTData, action_mask);
+                cache_entry.writeMask.orMask(action_mask);
+                cache_entry.Dirty := true;
+            }
+        }
+    }
+    
+    action(s_storeDoneComplete, "sc", desc="local store done complete") {
+        if (action_mask.isFirstValid(address)) {
+            peek(mandatoryQueue_in, RubyRequest) {
+                if (use_seq_not_coal) {
+                     DPRINTF(RubySlicc, "Sequencer does not define writeCompleteCallback\n");
+                     //assert(false);
+                } else {
+                    /* TODO If the action_mask is split then this will have an issue with instSeqNum */
+                    DPRINTF(WHD, "GPU store done complete: 0x%x, %s\n", address, action_mask);
+                    coalescer.writeCompleteCallback(in_msg.LineAddress, in_msg.instSeqNum, MachineType:L1Cache);
+                }
+            }
+        }
+    }
+
+    action(p_popMandatoryQueue, "pm", desc="Pop Mandatory Queue") {
+        if (action_mask.isFirstValid(address)) {
+            DPRINTF(RubySlicc, "Address: %x\n", address);
+            // peek_dangerous allows for the peeked message to be altered
+            // Use with caution and only asabsolutly required
+            peek_dangerous(mandatoryQueue_in, RubyRequest) {
+                // #define BYTES_PER_WORD 4 (commented for grep purposes)
+                // in_msg.writeMask.unsetMask(static_WriteMask.getByteOffset(address), 4);
+                in_msg.writeMask.unsetMask(action_mask);
+                DPRINTF(RubySlicc, "writeMask: %s\n",in_msg.writeMask);
+                DPRINTF(RubySlicc, "action_mask: %s\n",action_mask);
+                if (in_msg.writeMask.isEmpty()){
+                    mandatoryQueue_in.dequeue(clockEdge());
+                    DPRINTF(RubySlicc, "Mandatory Queue successfully popped\n");
+                }
+            }
+        }
+    }
+
+    action(pr_popResponseQueue, "pr", desc="Pop Response Queue") {
+        if (action_mask.isFirstValid(address)) {
+            // peek_dangerous allows for the peeked message to be altered
+            // Use with caution and only asabsolutly required
+            peek_dangerous(responseToL1Cache_in, ResponseMsg) {
+                in_msg.bitMask.unsetMask(action_mask);
+                if (in_msg.bitMask.isEmpty()){
+                    responseToL1Cache_in.dequeue(clockEdge());
+                }
+            }
+        }
+    }
+
+    action(mru_updateMRU, "mru", desc="Touch block for replacement policy") {
+        L1cache.setMRU(address);
+    }
+
+    action(a_allocate, "a", desc="allocate cache block") {
+        if (action_mask.isFirstValid(address)) {
+            if (is_invalid(cache_entry)) {
+                Addr line_addr := makeLineAddress(address);
+                set_cache_entry(L1cache.allocate(line_addr, new Entry));
+            }
+            cache_entry.writeMask.clear();
+        }
+    }
+
+    action(lc_loadCache, "lc", desc="load data from incoming message to cache block") {
+        if (action_mask.isFirstValid(address)) {
+            peek(responseToL1Cache_in, ResponseMsg) {
+                assert(is_valid(cache_entry));
+                cache_entry.DataBlk.copyPartial(in_msg.DataBlk, action_mask);
+                cache_entry.writeMask.orMask(action_mask);
+            }
+        }
+    }
+
+    action(l_loadInstDone, "li", desc="local load inst done") {
+        DataBlock dataBlk;
+        sequencer.readCallback(address, dataBlk, false, MachineType:L1Cache);
+    }
+
+    action(l_flashLoadDone, "lf", desc="flash load done") {
+        DPRINTF(WHD,"LoadDone action_mask: 0x%x, %s\n",makeLineAddress(address),action_mask);
+        coalescer.readCallback(address, MachineType:L1Cache, cache_entry.DataBlk);
+    }
+
+    action(inv_invDone, "inv", desc="local inv done") {
+        if (action_mask.isFirstValid(address)) {
+            peek_dangerous(mandatoryQueue_in, RubyRequest) {
+                in_msg.writeMask.unsetMask(action_mask);
+                if (in_msg.writeMask.isEmpty()) {
+                    if (use_seq_not_coal) {
+                        DPRINTF(RubySlicc, "Sequencer does not define invCallback!\n");
+                        assert(false);
+                    } else {
+                        coalescer.invTCPCallback(in_msg.LineAddress);
+                    }
+                }
+            }
+        }
+    }
+
+    action(ic_invCache, "ic", desc="invalidate cache line") {
+        if (action_mask.isFirstValid(address)) {
+            if (is_valid(cache_entry)) {
+                cache_entry.writeMask.clear();
+                L1cache.deallocate(makeLineAddress(address));
+            }
+            unset_cache_entry();
+        }
+    }
+
+    action(z_stall, "z", desc="stall; built-in") {
+        // built-in action
+    }
+
+    action(zz_recycleManQueue, "zz", desc="Send head to back") {
+        if(action_mask.isFirstValid(address)){
+            mandatoryQueue_in.recycle(clockEdge(), cyclesToTicks(recycle_latency));
+        }
+    }
+
+    /***************************TRANSITIONS************************************/
+    transition(I, Load) {
+        irv_issueReqV;
+        p_popMandatoryQueue;
+    }
+
+    transition({I,V}, Store, V) {
+        s_storeDataCopy;
+        s_storeDone;
+        s_storeDoneComplete;
+        p_popMandatoryQueue;
+    }
+    transition({I,V}, GPUStore, V) {
+        s_storeDataCopy;
+        s_storeDone;
+        s_storeDoneComplete;
+        p_popMandatoryQueue;
+    }
+
+    //transition({I,V}, GPUStore, T) {
+    //    s_storeDataCopy;
+    //    s_storeDone;
+    //    zz_recycleManQueue;
+    //}
+    //
+    //transition(T, GPUStore, V) {
+    //    s_storeDoneComplete;
+    //    p_popMandatoryQueue;
+    //}
+
+    transition(I, RspV, V) {
+        //a_allocate; For this protocol this is handled in the getCacheEntry call
+        lc_loadCache;
+        l_loadDone;
+        pr_popResponseQueue;
+    }
+
+    transition(V, Load, V) {
+        l_loadDone;
+        p_popMandatoryQueue;
+    }
+
+    transition(I, Fetch) {
+        l_loadInstDone;
+        ic_invCache;
+        p_popMandatoryQueue;
+    }
+
+    transition({I,V}, FlashLoad, V) {
+        l_flashLoadDone;
+        p_popMandatoryQueue;
+    }
+
+    transition(V, Fetch) {
+        l_loadInstDone;
+        p_popMandatoryQueue;
+    }
+
+    transition({I,V}, Evict, I) {
+        inv_invDone;
+        p_popMandatoryQueue;
+        ic_invCache;
+    }
+
+}

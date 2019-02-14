@@ -30,6 +30,7 @@
 
 #include <string>
 
+#include "mem/ruby/common/TypeDefines.hh"
 #include "mem/ruby/system/RubySystem.hh"
 
 namespace gem5
@@ -41,7 +42,106 @@ namespace ruby
 WriteMask::WriteMask()
     : mSize(RubySystem::getBlockSizeBytes()), mMask(mSize, false),
       mAtomic(false)
-{}
+    {}
+
+WriteMask::WriteMask(int size)
+      : mSize(size), mMask(size, false), mAtomic(false)
+    {}
+
+WriteMask::WriteMask(int size, std::vector<bool> & mask)
+      : mSize(size), mMask(mask), mAtomic(false)
+    {}
+
+WriteMask::WriteMask(int size, std::vector<bool> &mask,
+              std::vector<std::pair<int, AtomicOpFunctor*> > atomicOp)
+      : mSize(size), mMask(mask), mAtomic(true), mAtomicOp(atomicOp)
+    {}
+
+int WriteMask::getCount() const
+{
+    int count = 0;
+    for (int i = 0; i < mSize; i += BYTES_PER_WORD) {
+        if (mMask.at(i)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+void
+WriteMask::orMask(const WriteMask & writeMask)
+{
+    assert(mSize == writeMask.mSize);
+    for (int i = 0; i < mSize; i++) {
+        mMask[i] = (mMask.at(i)) | (writeMask.mMask.at(i));
+    }
+
+    if (writeMask.mAtomic) {
+        mAtomic = true;
+        mAtomicOp = writeMask.mAtomicOp;
+    }
+}
+
+void
+WriteMask::andMask(const WriteMask & writeMask)
+{
+    assert(mSize == writeMask.mSize);
+    for (int i = 0; i < mSize; i++) {
+        mMask[i] = (mMask.at(i)) && (writeMask.mMask.at(i));
+    }
+
+    if (writeMask.mAtomic) {
+        mAtomic = true;
+        mAtomicOp = writeMask.mAtomicOp;
+    }
+}
+
+void
+WriteMask::performAtomic(uint8_t * p) const
+{
+    for (int i = 0; i < mAtomicOp.size(); i++) {
+        int offset = mAtomicOp[i].first;
+        AtomicOpFunctor *fnctr = mAtomicOp[i].second;
+        (*fnctr)(&p[offset]);
+    }
+}
+
+void
+WriteMask::performAtomic(DataBlock & blk) const
+{
+    for (int i = 0; i < mAtomicOp.size(); i++) {
+        int offset = mAtomicOp[i].first;
+        uint8_t *p = blk.getDataMod(offset);
+        AtomicOpFunctor *fnctr = mAtomicOp[i].second;
+        (*fnctr)(p);
+    }
+}
+    bool WriteMask::isFirstValid(Addr address) const {
+        int idx = address - makeLineAddress(address);
+        for (int i = 0; i < mSize; i++) {
+            if (mMask[i]) {
+                return (idx == i);
+            }
+        }
+        return false;
+    }
+
+    bool WriteMask::isLastValid(Addr address) const {
+        int idx = address - makeLineAddress(address);
+        for (int i = (mSize-1); i >= 0; i--) {
+            if (mMask[i]) {
+                return (idx == (i&~3));
+            }
+        }
+        return false;
+    }
+// Should be static, but that can't be used in slicc
+int WriteMask::getWordOffset(Addr physAddr) const {
+    return (physAddr-makeLineAddress(physAddr))/BYTES_PER_WORD;
+}
+int WriteMask::getByteOffset(Addr physAddr) const {
+    return (physAddr-makeLineAddress(physAddr));
+}
 
 void
 WriteMask::print(std::ostream& out) const

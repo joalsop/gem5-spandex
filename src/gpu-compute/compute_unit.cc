@@ -34,6 +34,7 @@
 #include "gpu-compute/compute_unit.hh"
 
 #include <limits>
+#include <gem5/denovo_region_api.h>
 
 #include "arch/x86/page_size.hh"
 #include "base/output.hh"
@@ -47,6 +48,7 @@
 #include "debug/GPURename.hh"
 #include "debug/GPUSync.hh"
 #include "debug/GPUTLB.hh"
+#include "debug/WHD.hh"
 #include "gpu-compute/dispatcher.hh"
 #include "gpu-compute/gpu_command_processor.hh"
 #include "gpu-compute/gpu_dyn_inst.hh"
@@ -744,9 +746,11 @@ ComputeUnit::exec()
     // Put this CU to sleep if there is no more work to be done.
     if (!isDone()) {
         schedule(tickEvent, nextCycle());
+        //DPRINTF(WHD, "CU: Schedule CU::exec()\n");
     } else {
         shader->notifyCuSleep();
         DPRINTF(GPUDisp, "CU%d: Going to sleep\n", cu_id);
+        //DPRINTF(WHD, "CU: Going to sleep\n");
     }
 }
 
@@ -879,6 +883,7 @@ ComputeUnit::DataPort::recvTimingResp(PacketPtr pkt)
                             gpuDynInst->disassemble(), w->outstandingReqs,
                             w->outstandingReqs - 1);
             computeUnit->globalMemoryPipe.handleResponse(gpuDynInst);
+            //DPRINTF(WHD, "CU: Decrementing outstanding reqs\n");
         }
 
         delete pkt->senderState;
@@ -893,10 +898,13 @@ ComputeUnit::DataPort::recvTimingResp(PacketPtr pkt)
             "CU%d: WF[%d][%d]: gpuDynInst: %d, index %d, addr %#x received!\n",
             computeUnit->cu_id, gpuDynInst->simdId, gpuDynInst->wfSlotId,
             gpuDynInst->seqNum(), index, pkt->req->getPaddr());
-
-    computeUnit->schedule(mem_resp_event,
-                          curTick() + computeUnit->resp_tick_latency);
-
+    if (pkt->cmd == MemCmd::MessageResp) {
+        computeUnit->schedule(mem_resp_event,
+                              curTick() + computeUnit->resp_tick_latency+1);
+    } else {
+        computeUnit->schedule(mem_resp_event,
+                              curTick() + computeUnit->resp_tick_latency);
+    }
     return true;
 }
 
@@ -1012,6 +1020,11 @@ ComputeUnit::sendRequest(GPUDynInstPtr gpuDynInst, PortID index, PacketPtr pkt)
 {
     // There must be a way around this check to do the globalMemStart...
     Addr tmp_vaddr = pkt->req->getVaddr();
+
+    // TODO: use workgroup id instead of const
+    // remove #include <gem5/denovo_region_api.h>
+    // pkt->req->setContext(wfList[0][0]->wgId);
+    pkt->req->setContext(GPU_CONTEXTS);
 
     updatePageDivergenceDist(tmp_vaddr);
 
@@ -1162,6 +1175,7 @@ ComputeUnit::sendRequest(GPUDynInstPtr gpuDynInst, PortID index, PacketPtr pkt)
         if (pkt->cmd == MemCmd::MemSyncReq) {
             gpuDynInst->resetEntireStatusVector();
         } else {
+            //DPRINTF(WHD, "CU: decrementStatusVector Flag1\n");
             gpuDynInst->decrementStatusVector(index);
         }
 
@@ -1308,6 +1322,7 @@ ComputeUnit::injectGlobalMemFence(GPUDynInstPtr gpuDynInst,
 void
 ComputeUnit::DataPort::processMemRespEvent(PacketPtr pkt)
 {
+
     DataPort::SenderState *sender_state =
         safe_cast<DataPort::SenderState*>(pkt->senderState);
 
@@ -1316,6 +1331,36 @@ ComputeUnit::DataPort::processMemRespEvent(PacketPtr pkt)
 
     assert(gpuDynInst);
 
+    /* **********START********** */
+    if (pkt->cmd == MemCmd::MessageResp) {
+        // this is for writeComplete callback
+        // we simply get decrement write-related wait counters
+        assert(gpuDynInst);
+        Wavefront *w M5_VAR_USED =
+            computeUnit->wfList[gpuDynInst->simdId][gpuDynInst->wfSlotId];
+        assert(w);
+        DPRINTF(GPUExec, "MessageResp: WF[%d][%d] WV%d %s decrementing "
+                        "outstanding reqs %d => %d\n", gpuDynInst->simdId,
+                        gpuDynInst->wfSlotId, gpuDynInst->wfDynId,
+                        gpuDynInst->disassemble(), w->outstandingReqs,
+                        w->outstandingReqs - 1);
+        if (gpuDynInst->allLanesZero()) {
+            // ask gm pipe to decrement request counters, instead of directly
+            // performing here, to avoid asynchronous counter update and
+            // instruction retirement (which may hurt waincnt effects)
+            computeUnit->globalMemoryPipe.handleResponse(gpuDynInst);
+            DPRINTF(GPUMem, "CU%d: WF[%d][%d]: write totally complete\n",
+                            computeUnit->cu_id, gpuDynInst->simdId,
+                            gpuDynInst->wfSlotId);
+        }
+
+        delete pkt->senderState;
+        delete pkt->req;
+        delete pkt;
+
+        return;
+    }
+    /* **********END********** */
     DPRINTF(GPUPort, "CU%d: WF[%d][%d]: Response for addr %#x, index %d\n",
             compute_unit->cu_id, gpuDynInst->simdId, gpuDynInst->wfSlotId,
             pkt->req->getPaddr(), id);
@@ -1342,7 +1387,9 @@ ComputeUnit::DataPort::processMemRespEvent(PacketPtr pkt)
     gpuDynInst->memStatusVector[paddr].pop_back();
     gpuDynInst->pAddr = pkt->req->getPaddr();
 
+    //DPRINTF(WHD, "CU: decrementStatusVector Flag2\n");
     gpuDynInst->decrementStatusVector(index);
+    //DPRINTF(WHD, "bitvector is now %s\n", gpuDynInst->printStatusVector());
     DPRINTF(GPUMem, "bitvector is now %s\n", gpuDynInst->printStatusVector());
 
     if (gpuDynInst->allLanesZero()) {
@@ -1369,9 +1416,19 @@ ComputeUnit::DataPort::processMemRespEvent(PacketPtr pkt)
             profileRoundTripTime(curTick(), InstMemoryHop::GMEnqueue);
         compute_unit->globalMemoryPipe.handleResponse(gpuDynInst);
 
+<<<<<<< HEAD
         DPRINTF(GPUMem, "CU%d: WF[%d][%d]: packet totally complete\n",
                 compute_unit->cu_id, gpuDynInst->simdId,
                 gpuDynInst->wfSlotId);
+=======
+            //DPRINTF(WHD, "CU: CU%d: WF[%d][%d]: packet totally complete\n",
+            //        compute_unit->cu_id, gpuDynInst->simdId,
+            //        gpuDynInst->wfSlotId);
+            DPRINTF(GPUMem, "CU%d: WF[%d][%d]: packet totally complete\n",
+                    compute_unit->cu_id, gpuDynInst->simdId,
+                    gpuDynInst->wfSlotId);
+        }
+>>>>>>> e9628e7528 (Added spandex-msg file)
     } else {
         if (pkt->isRead()) {
             if (!compute_unit->headTailMap.count(gpuDynInst)) {
@@ -1386,8 +1443,7 @@ ComputeUnit::DataPort::processMemRespEvent(PacketPtr pkt)
 }
 
 bool
-ComputeUnit::DTLBPort::recvTimingResp(PacketPtr pkt)
-{
+ComputeUnit::DTLBPort::recvTimingResp(PacketPtr pkt) {
     Addr line = pkt->req->getPaddr();
 
     DPRINTF(GPUTLB, "CU%d: DTLBPort received %#x->%#x\n", computeUnit->cu_id,

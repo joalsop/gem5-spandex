@@ -423,7 +423,7 @@ for i in range(args.num_cpus):
 
 host_cpu = cpu_list[0]
 
-hsapp_gpu_map_vaddr = 0x200000000
+hsapp_gpu_map_vaddr= 0x200000000
 hsapp_gpu_map_size = 0x1000
 hsapp_gpu_map_paddr = int(Addr(args.mem_size))
 

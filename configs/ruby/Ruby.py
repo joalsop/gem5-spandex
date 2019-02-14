@@ -100,6 +100,7 @@ def define_options(parser):
     Network.define_options(parser)
 
 def setup_memory_controllers(system, ruby, dir_cntrls, options):
+
     if (options.numa_high_bit):
         block_size_bits = options.numa_high_bit + 1 - \
                           int(math.log(options.num_dirs, 2))

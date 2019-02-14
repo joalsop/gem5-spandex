@@ -1,0 +1,122 @@
+machine(MachineType:ICache, "LoopBack I Cache") :
+    Sequencer *sequencer;
+    CacheMemory *L1cache;
+    MessageBuffer *mandatoryQueue;
+{
+    // Enumerations
+    state_declaration(State, desc="Loopback I Cache States", default="ICache_State_I") {
+        I, AccessPermission:Invalid, desc="Invalid";
+        V, AccessPermission:Read_Only, desc="Valid";
+    }
+
+    enumeration(Event, desc="ICache Events") {
+        Fetch, desc="Fetch";
+    }
+
+    // Structures
+    structure(Entry, desc="...", interface="AbstractCacheEntry") {
+        State CacheState,   desc="cache state";
+        DataBlock DataBlk,  desc="data block";
+    }
+
+    structure(TBE, desc="...") {
+        State TBEState, desc="tbe state";
+        DataBlock DataBlk, desc="tbe data";
+    } 
+
+    structure(TBETable, external="yes", desc="...") {
+        TBE lookup(Addr), desc="...";
+        void allocate(Addr), desc="...";
+        void deallocate(Addr), desc="...";
+        bool isPresent(Addr), desc="...";
+    }
+    
+    TBETable TBEs, template="<ICache_TBE>", constructor="m_number_of_TBEs";
+    void set_cache_entry(AbstractCacheEntry b);
+    void unset_cache_entry();
+    void set_tbe(TBE b);
+    void unset_tbe();
+    void wakeUpAllBuffers();
+    void wakeUpBuffers(Addr a);
+    Cycles curCycle();
+
+    // Internal functions
+    Tick clockEdge();
+    
+    Entry getCacheEntry(Addr address), return_by_pointer="yes" {
+        Entry cache_entry := static_cast(Entry, "pointer", L1cache.lookup(address));
+        if (is_valid(cache_entry)) {
+            return cache_entry;
+        }
+        cache_entry := static_cast(Entry, "pointer", L1cache.allocate(address, new Entry));
+        return cache_entry;
+    }
+
+    State getState(TBE tbe, Entry cache_entry, Addr addr) {
+        if (is_valid(cache_entry)) {
+            return cache_entry.CacheState;
+        }
+        return State:I;
+    }
+
+    void setState(TBE tbe, Entry cache_entry, Addr addr, State state) {
+        if (is_valid(cache_entry)) {
+            cache_entry.CacheState := state;
+        }
+    }
+
+    void functionalRead(Addr addr, Packet *pkt) {
+        functionalMemoryRead(pkt);
+    }
+
+    int functionalWrite(Addr addr, Packet *pkt) {
+        int num_functional_writes := 0;
+        num_functional_writes := num_functional_writes +
+            functionalMemoryWrite(pkt);
+        return num_functional_writes;
+    }
+
+    AccessPermission getAccessPermission(Addr addr) {
+      return AccessPermission:NotPresent;
+    }
+
+    void setAccessPermission(Entry cache_entry, Addr addr, State state) {
+        // Intentionally unimplemented  
+    }
+
+    // Ingress
+    in_port(mandatoryQueue_in, RubyRequest, mandatoryQueue, desc="...") {
+        if (mandatoryQueue_in.isReady(clockEdge())) {
+            peek(mandatoryQueue_in, RubyRequest, block_on="LineAddress") {
+                Entry cache_entry := getCacheEntry(in_msg.LineAddress);
+                TBE tbe := TBEs.lookup(in_msg.LineAddress);
+                trigger(Event:Fetch, in_msg.LineAddress, cache_entry, tbe);
+            }
+        }
+    }
+
+    // Actions
+    action(p_popMandatoryQueue, "pm", desc="Pop man queue") {
+        mandatoryQueue_in.dequeue(clockEdge());
+    }
+
+    action(l_loadDone, "l", desc="local load done") {
+        DataBlock tmp;
+        sequencer.readCallback(address, tmp, false, MachineType:L1Cache);
+    }
+
+    action(ic_invCache, "ic", desc="invalidate cache line") {
+        if (is_valid(cache_entry)) {
+            L1cache.deallocate(address);
+        }
+        unset_cache_entry();
+    }
+
+    // Transition
+    transition(I, Fetch) {
+        l_loadDone;
+        ic_invCache;
+        p_popMandatoryQueue;
+    }
+
+}

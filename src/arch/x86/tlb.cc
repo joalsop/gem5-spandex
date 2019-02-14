@@ -53,6 +53,7 @@
 #include "mem/packet_access.hh"
 #include "mem/page_table.hh"
 #include "mem/request.hh"
+#include "sim/denovo_region_table.hh"
 #include "sim/full_system.hh"
 #include "sim/process.hh"
 #include "sim/pseudo_inst.hh"
@@ -197,8 +198,10 @@ localMiscRegAccess(bool read, MiscRegIndex regNum,
 Fault
 TLB::translateInt(bool read, RequestPtr req, ThreadContext *tc)
 {
+
     DPRINTF(TLB, "Addresses references internal memory.\n");
     Addr vaddr = req->getVaddr();
+
     Addr prefix = (vaddr >> 3) & IntAddrPrefixMask;
     if (prefix == IntAddrPrefixCPUID) {
         panic("CPUID memory space not yet implemented!\n");

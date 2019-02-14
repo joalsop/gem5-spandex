@@ -1,0 +1,1607 @@
+machine(MachineType:L1Cache, "Spandex L1 Cache") :
+    CacheMemory *L1cache;
+
+    DeNovoCoalescer *coalescer;
+    SpandexSequencer *sequencer;
+
+    Cycles issue_latency := 40;
+    Cycles l2_hit_latency := 18;
+
+    bool use_seq_not_coal;
+
+    MessageBuffer *mandatoryQueue;
+
+    /* Ingess */
+    MessageBuffer *responseToL1Cache, network="From", virtual_network="3", vnet_type="response";
+    MessageBuffer *requestToL1Cache, network="From", virtual_network="1", vnet_type="request";
+    MessageBuffer *peerResponseToL1Cache, network="From", virtual_network="4", vnet_type="response";
+    MessageBuffer *peerRequestToL1Cache, network="From", virtual_network="5", vnet_type="request";
+
+    /* Egress */
+    MessageBuffer *responseFromL1Cache, network="To", virtual_network="3", vnet_type="response";
+    MessageBuffer *requestFromL1Cache, network="To", virtual_network="1", vnet_type="request";
+    MessageBuffer *peerResponseFromL1Cache, network="To", virtual_network="4", vnet_type="response";
+    MessageBuffer *peerRequestFromL1Cache, network="To", virtual_network="5", vnet_type="request";
+{
+
+    /*******************************STATES*************************************/
+    state_declaration(State, desc="Primary Cache States", default="L1Cache_State_I") {
+        /* NOTE: Default state must be listed first for word granularity.
+         * Also NOTE, all states must be in the State state_declaration (even transients)
+         * otherwise the casting requered for StateVec will not work. */
+        I,  AccessPermission:Invalid,   desc="Invalid";
+        V,  AccessPermission:Read_Only, desc="Valid";
+        S,  AccessPermission:Read_Only, desc="Shared";
+        O,  AccessPermission:Read_Write,desc="Owned";
+        /* Transiants */
+        IV,  AccessPermission:Busy, desc="I to V";
+        IS,  AccessPermission:Busy, desc="I to S";
+        WTV, AccessPermission:Busy, desc="WT to V";
+        WTI, AccessPermission:Busy, desc="WT to I";
+        IO,  AccessPermission:Busy, desc="I to O";
+        IOdata, AccessPermission:Busy, desc="I to O+data";
+        OI_2, AccessPermission:Busy, desc="Second stage OI, waiting on request from new owner, or nack from LLC";
+        OI_1, AccessPermission:Busy, desc="First state OI, can complete or go to stage 2 depending on LLC";
+        IOI,  AccessPermission:Busy, desc="Waiting on ownership, but will immediately forward to another core";
+        IOS,  AccessPermission:Busy, desc="Waiting on ownership, but will immediately shate with another core";
+    }
+
+
+    /*******************************EVENTS*************************************/
+    enumeration(Event, desc="Cache Events") {
+        ReqV,       desc="Request valid state";
+        ReqO,       desc="Request owned state";
+        ReqS,       desc="Request shared state";
+        Inv,        desc="Inbound request invalid state";
+        InvS,       desc="Inbound request to invalidate shared state";
+        ReqWT,      desc="Req write to L1 and L2";
+        Repl,       desc="Replace block from cache";
+        Repl_rsp,   desc="Replace block from cache, triggered by rspQ";
+        Repl_prsp,  desc="Replace block from cache, triggered by peer rspQ";
+        Repl_man,   desc="Replace block from cache, triggered by manQ";
+        ReqOData,   desc="Request data and ownership for it";
+        ReqWTData,  desc="Request write to L2";
+        RvkO,       desc="Request to revoke ownership for the word";
+        Evict,      desc="Evict cache entry";
+
+        FwdReqO,        desc="Forwarded request for ownership";
+        FwdReqV,        desc="Forwarded request for valid data";
+        FwdReqOData,    desc="Forwarded request for ownership and data";
+        FwdReqS,        desc="Forwarded request for shared data";
+
+        RspV,       desc="Response to a reqV";
+        RspO,       desc="Response to a reqO";
+        RspS,       desc="Response to a reqS";
+        peerRspV,   desc="Response to a fwdReqV";
+        peerRspO,   desc="Response to a fwdReqO";
+        peerRspS,   desc="Response to a fwdReqS";
+        RspOData,   desc="Response to a reqOData";
+        RspWB_1,    desc="Response to a reqWB, advance to stage 2, OI_2, until FwdReq comes in";
+        RspWB_2,    desc="Response to a reqWB, complete WB";
+        Fetch,      desc="I Fetch";
+
+        AckWB,      desc="Recieve ack for WB req";
+        NackWB,     desc="Recieve nack for WB req (directory no longer lists cache as owner)";
+        NackReqV,   desc="Recieve nack for reqV";
+
+        SelfInv,    desc="Self-Invalidate";
+    }
+
+    /*********************************STRUCTURES*******************************/
+    structure(StateVec, external="yes", desc="...") {
+         void   setAt(int, State),      desc="...";
+         State  getAt(int),             desc="...";
+         bool   contains(State),        desc="...";
+         bool   containsOnly(State),        desc="...";
+         int    getSize(),              desc="...";
+         void   cpyVec(StateVec),       desc="...";
+    }
+
+    structure(Entry, desc="...", interface="AbstractCacheEntry") {
+        StateVec WordStates,    desc="State vector for the words of a cache line";
+        bool Dirty,             desc="Is the data dirty (diff than memory)?";
+        DataBlock DataBlk,      desc="data for the block";
+        WriteMask writeMask,    desc="written bytes masks (dirty mask)";
+    }
+
+    structure(TBE, desc="...") {
+        /* NOTE StateVec WordStates needed here because of an edge case I can't remember at the moment
+         * ask John when this comes up again */
+        StateVec WordStates,    desc="State vector for the words of a cache line";
+        WriteMask BitMask,      desc="bitMask of outstanding requests for the assocated cacheblock";
+        DataBlock DataBlk,      desc="data for the block, required for concurrent writebacks";
+        bool Dirty,             desc="Is the data dirty (different than memory)?";
+        int NumPendingMsgs,     desc="Number of acks/data messages that this processor is waiting for";
+        bool Shared,            desc="Victim hit by shared probe";
+     }
+
+    structure(TBETable, external="yes", desc="...") {
+        TBE lookup(Addr), desc="...";
+        void allocate(Addr), desc="...";
+        void deallocate(Addr), desc="...";
+        bool isPresent(Addr), desc="...";
+    }
+    TBETable TBEs, template="<L1Cache_TBE>", constructor="m_number_of_TBEs";
+
+    /************************EXTERNAL FUNCTIONS*******************************/
+    Cycles curCycle();
+
+    /* These functions set the cache_entry and tbe variables to
+     * the passed value and NULL for set and unset respectivly */
+    void set_cache_entry(AbstractCacheEntry b);
+    void unset_cache_entry();
+    void set_tbe(TBE b);
+    void unset_tbe();
+    void wakeUpAllBuffers();
+    void wakeUpAllBuffers(Addr);
+
+    Tick cyclesToTicks(Cycles c);
+    MachineID mapAddressToMachine(Addr addr, MachineType mtype);
+    Tick clockEdge();
+
+    /************************INTERNAL FUNCTIONS*******************************/
+    Entry getCacheEntry(Addr address), return_by_pointer="yes" {
+        Entry cache_entry := static_cast(Entry, "pointer", L1cache.lookup(address));
+        return cache_entry;
+    }
+
+    /* Get/Set State */
+    State getState(TBE tbe, Entry cache_entry, Addr addr ) {
+        int idx := cache_entry.writeMask.getWordOffset(addr);
+        if (is_valid(tbe)) {
+            return static_cast(State, "state", tbe.WordStates.getAt(idx));
+        } else if (is_valid(cache_entry)) {
+            return static_cast(State, "state", cache_entry.WordStates.getAt(idx));
+        }
+        return State:I;
+    }
+
+    void setState(TBE tbe, Entry cache_entry, Addr addr, State state) {
+        int idx := cache_entry.writeMask.getWordOffset(addr);
+        if (is_valid(tbe)) {
+            tbe.WordStates.setAt(idx, state);
+        }
+        if (is_valid(cache_entry)) {
+            cache_entry.WordStates.setAt(idx, state);
+        }
+    }
+
+    /* Functional Read and Write */
+    void functionalRead(Addr addr, Packet *pkt) {
+        TBE tbe := TBEs.lookup(addr);
+        if(is_valid(tbe)) {
+            testAndRead(addr, tbe.DataBlk, pkt);
+        } else {
+            functionalMemoryRead(pkt);
+        }
+    }
+
+    int functionalWrite(Addr addr, Packet *pkt) {
+        int num_functional_writes := 0;
+
+        TBE tbe := TBEs.lookup(addr);
+        if(is_valid(tbe)) {
+            num_functional_writes := num_functional_writes +
+                testAndWrite(addr, tbe.DataBlk, pkt);
+        }
+
+        num_functional_writes := num_functional_writes +
+            functionalMemoryWrite(pkt);
+        return num_functional_writes;
+    }
+
+    /* Access Permission Functions */
+    AccessPermission getAccessPermission(Addr addr) {
+        return AccessPermission:NotPresent;
+    }
+    void setAccessPermission(Entry cache_entry, Addr addr, State state) { }
+
+    /***************************IN PORT****************************************/
+    in_port(responseToL1Cache_in, ResponseMsg, responseToL1Cache, desc="Responses sent from L2, recieved by L1", rank=4) {
+       if (responseToL1Cache_in.isReady(clockEdge())) {
+            peek(responseToL1Cache_in, ResponseMsg, block_on="LineAddress") {
+                Entry cache_entry := getCacheEntry(in_msg.LineAddress);
+                TBE tbe := TBEs.lookup(in_msg.LineAddress);
+                DPRINTF(RubySlicc, "GET TBE: Addr: 0x%x Type: %s\n",in_msg.LineAddress, in_msg.Type);
+                assert(is_valid(tbe)); //NOTE TBE should not have been kicked while waiting for a response
+                if (in_msg.Type == CoherenceResponseType:RspV) {
+                    // If addr is still in cache or avail
+                    if (is_valid(cache_entry) || L1cache.cacheAvail(in_msg.LineAddress)) {
+                        //DPRINTF(RubySlicc, "LineAddress:%x, Mask:%s\n",tbe,in_msg.LineAddress, in_msg.bitMask);
+                        triggerLine(Event:RspV, in_msg.LineAddress, cache_entry, tbe, in_msg.bitMask);
+                    } else {
+                        Addr victim := L1cache.cacheProbe(in_msg.LineAddress);
+                        /* NOTE cannot mix traditional triggers with triggerLines
+                         * so we need to create a full WriteMask to dictate the Repl
+                         * event must be called on the complete line */
+                        WriteMask fullLine;
+                        fullLine.fillMask();
+                        DPRINTF(RubySlicc, "Full cache, kicking victim 0x%x for 0x%x\n", victim, in_msg.LineAddress);
+                        triggerLine(Event:Repl_rsp, victim, getCacheEntry(victim), TBEs.lookup(victim), fullLine);
+                    }
+                } else if (in_msg.Type == CoherenceResponseType:RspO) {
+                    // If addr is still in cache or avail
+                    if (is_valid(cache_entry) || L1cache.cacheAvail(in_msg.LineAddress)) {
+                        triggerLine(Event:RspO, in_msg.LineAddress, cache_entry, tbe, in_msg.bitMask);
+                    } else {
+                        Addr victim := L1cache.cacheProbe(in_msg.LineAddress);
+                        /* NOTE cannot mix traditional triggers with triggerLines
+                         * so we need to create a full WriteMask to dictate the Repl
+                         * event must be called on the complete line */
+                        WriteMask fullLine;
+                        fullLine.fillMask();
+                        DPRINTF(RubySlicc, "Full cache, kicking victim 0x%x for 0x%x\n", victim, in_msg.LineAddress);
+                        triggerLine(Event:Repl_rsp, victim, getCacheEntry(victim), TBEs.lookup(victim), fullLine);
+                    }
+                } else if (in_msg.Type == CoherenceResponseType:RspS) {
+                    // If addr is still in cache or avail
+                    if (is_valid(cache_entry) || L1cache.cacheAvail(in_msg.LineAddress)) {
+                        triggerLine(Event:RspS, in_msg.LineAddress, cache_entry, tbe, in_msg.bitMask);
+                    } else {
+                        Addr victim := L1cache.cacheProbe(in_msg.LineAddress);
+                        /* NOTE cannot mix traditional triggers with triggerLines
+                         * so we need to create a full WriteMask to dictate the Repl
+                         * event must be called on the complete line */
+                        WriteMask fullLine;
+                        fullLine.fillMask();
+                        DPRINTF(RubySlicc, "Full cache, kicking victim 0x%x for 0x%x\n", victim, in_msg.LineAddress);
+                        triggerLine(Event:Repl_rsp, victim, getCacheEntry(victim), TBEs.lookup(victim), fullLine);
+                    }
+                } else if (in_msg.Type == CoherenceResponseType:RspWB) {
+                        DPRINTF(RubySlicc, "Processing RspWB of 0x%x\n", in_msg.LineAddress);
+                        WriteMask wm2;
+                        wm2.cpyMask(tbe.BitMask);
+                        wm2.andMask(in_msg.bitMask);
+
+                        WriteMask wm1;
+                        wm1.cpyMask(tbe.BitMask);
+                        wm1.unsetMask(in_msg.bitMask);
+
+                        triggerLines(Event:RspWB_2, in_msg.LineAddress, cache_entry, tbe, wm2,
+                                     Event:RspWB_1, in_msg.LineAddress, cache_entry, tbe, wm1);
+                } else {
+                    error("Unexpected responseToL1Cache type\n");
+                }
+            }
+       }
+    }
+
+    in_port(peerResponseToL1Cache_in, ResponseMsg, peerResponseToL1Cache, desc="Responses sent by remote L1, received by local L1", rank=3) {
+        if (peerResponseToL1Cache_in.isReady(clockEdge())) {
+            peek(peerResponseToL1Cache_in, ResponseMsg, block_on="LineAddress") {
+                Entry cache_entry := getCacheEntry(in_msg.LineAddress);
+                TBE tbe := TBEs.lookup(in_msg.LineAddress);
+                assert(is_valid(tbe));
+                if (in_msg.Type == CoherenceResponseType:NackReqV) {
+                    triggerLine(Event:NackReqV, in_msg.LineAddress, cache_entry, tbe, in_msg.bitMask);
+                }  else if (in_msg.Type == CoherenceResponseType:RspV) {
+                    // If addr is still in cache or avail
+                    if (is_valid(cache_entry) || L1cache.cacheAvail(in_msg.LineAddress)) {
+                        triggerLine(Event:peerRspV, in_msg.LineAddress, cache_entry, tbe, in_msg.bitMask);
+                    } else {
+                        Addr victim := L1cache.cacheProbe(in_msg.LineAddress);
+                        /* NOTE cannot mix traditional triggers with triggerLines
+                         * so we need to create a full WriteMask to dictate the Repl
+                         * event must be called on the complete line */
+                        WriteMask fullLine;
+                        fullLine.fillMask();
+                        DPRINTF(RubySlicc, "Full cache, kicking victim 0x%x for 0x%x\n", victim, in_msg.LineAddress);
+                        triggerLine(Event:Repl_prsp, victim, getCacheEntry(victim), TBEs.lookup(victim), fullLine);
+                    }
+                } else if (in_msg.Type == CoherenceResponseType:RspO) {
+                    // If addr is still in cache or avail
+                    if (is_valid(cache_entry) || L1cache.cacheAvail(in_msg.LineAddress)) {
+                        DPRINTF(RubySlicc, "Got a RspO from %s\n", in_msg.Sender);
+                        triggerLine(Event:peerRspO, in_msg.LineAddress, cache_entry, tbe, in_msg.bitMask);
+                    } else {
+                        Addr victim := L1cache.cacheProbe(in_msg.LineAddress);
+                        /* NOTE cannot mix traditional triggers with triggerLines
+                         * so we need to create a full WriteMask to dictate the Repl
+                         * event must be called on the complete line */
+                        WriteMask fullLine;
+                        fullLine.fillMask();
+                        DPRINTF(RubySlicc, "Full cache, kicking victim 0x%x for 0x%x\n", victim, in_msg.LineAddress);
+                        triggerLine(Event:Repl_prsp, victim, getCacheEntry(victim), TBEs.lookup(victim), fullLine);
+                    }
+                } else if (in_msg.Type == CoherenceResponseType:RspS) {
+                    // If addr is still in cache or avail
+                    if (is_valid(cache_entry) || L1cache.cacheAvail(in_msg.LineAddress)) {
+                        triggerLine(Event:peerRspS, in_msg.LineAddress, cache_entry, tbe, in_msg.bitMask);
+                    } else {
+                        Addr victim := L1cache.cacheProbe(in_msg.LineAddress);
+                        /* NOTE cannot mix traditional triggers with triggerLines
+                         * so we need to create a full WriteMask to dictate the Repl
+                         * event must be called on the complete line */
+                        WriteMask fullLine;
+                        fullLine.fillMask();
+                        DPRINTF(RubySlicc, "Full cache, kicking victim 0x%x for 0x%x\n", victim, in_msg.LineAddress);
+                        triggerLine(Event:Repl_prsp, victim, getCacheEntry(victim), TBEs.lookup(victim), fullLine);
+                    }
+                } else {
+                    error("Unexpected ResponseType in peerResponse queue\n");
+                }
+            }
+        }
+    }
+
+    /* TODO oops, this is amost certainly not needed */
+    in_port(peerRequestToL1Cache_in, RequestMsg, peerRequestToL1Cache, desc="Requests sent by remote L1, recevied by local L1", rank=2) {
+        if (peerRequestToL1Cache_in.isReady(clockEdge())) {
+            peek(peerRequestToL1Cache_in, RequestMsg, block_on="LineAddress") {
+                Entry cache_entry := getCacheEntry(in_msg.LineAddress);
+                TBE tbe := TBEs.lookup(in_msg.LineAddress);
+                // TODO stuff about TBE aka outstanding requests
+                if (in_msg.Type == CoherenceRequestType:FwdReqO) {
+                    triggerLine(Event:FwdReqO, in_msg.LineAddress, cache_entry, tbe, in_msg.bitMask);
+                } else if (in_msg.Type == CoherenceRequestType:FwdReqOdata) {
+                    triggerLine(Event:FwdReqOData, in_msg.LineAddress, cache_entry, tbe, in_msg.bitMask);
+                } else {
+                    error("Unexpected RequestType in peerRequest queue\n");
+                }
+            }
+        }
+    }
+
+    in_port(requestToL1Cache_in, RequestMsg, requestToL1Cache, desc="Requests sent from L2, recieved by L1", rank=1) {
+        if (requestToL1Cache_in.isReady(clockEdge())) {
+            peek(requestToL1Cache_in, RequestMsg, block_on="LineAddress") {
+                Entry cache_entry := getCacheEntry(in_msg.LineAddress);
+                TBE tbe := TBEs.lookup(in_msg.LineAddress);
+                // TODO stuff about TBE aka outstanding requests
+                if (in_msg.Type == CoherenceRequestType:Inv) {
+                    triggerLine(Event:Inv, in_msg.LineAddress, cache_entry, tbe, in_msg.bitMask);
+                } else if (in_msg.Type == CoherenceRequestType:FwdReqO) {
+                    triggerLine(Event:FwdReqO, in_msg.LineAddress, cache_entry, tbe, in_msg.bitMask);
+                } else if (in_msg.Type == CoherenceRequestType:FwdReqOdata) {
+                    triggerLine(Event:FwdReqOData, in_msg.LineAddress, cache_entry, tbe, in_msg.bitMask);
+                } else if (in_msg.Type == CoherenceRequestType:FwdReqV) {
+                    DPRINTF(RubySlicc, "processing FwdReqV\n");
+                    triggerLine(Event:FwdReqV, in_msg.LineAddress, cache_entry, tbe, in_msg.bitMask);
+                } else if (in_msg.Type == CoherenceRequestType:FwdReqS) {
+                    triggerLine(Event:FwdReqS, in_msg.LineAddress, cache_entry, tbe, in_msg.bitMask);
+                } else if (in_msg.Type == CoherenceRequestType:ReqRvkO) {
+                    triggerLine(Event:RvkO, in_msg.LineAddress, cache_entry, tbe, in_msg.bitMask);
+                } else {
+                    error("Unexpected RequestType in request queue\n");
+                }
+            }
+        }
+    }
+
+    /* NOTE: Lowest priority so must go at bottom */
+    in_port(mandatoryQueue_in, RubyRequest, mandatoryQueue, desc="...", rank=0) {
+        if (mandatoryQueue_in.isReady(clockEdge())) {
+            peek(mandatoryQueue_in, RubyRequest, block_on="LineAddress") {
+                //DPRINTF(RubySlicc, "mandatoryQueue in_msg: %s\n", in_msg);
+                Entry cache_entry := getCacheEntry(in_msg.LineAddress);
+                TBE tbe := TBEs.lookup(in_msg.LineAddress);
+                /* TODO Update with Sam's stuff */
+                if (in_msg.Type == RubyRequestType:LD) {
+                    // NOTE we don't need to worry about Repl until the rspV
+                    triggerLine(Event:ReqV, in_msg.LineAddress, cache_entry, tbe, in_msg.writeMask);
+
+                } else if (in_msg.Type == RubyRequestType:ST) {
+                    if ( is_valid(cache_entry) || L1cache.cacheAvail(in_msg.LineAddress) ) {
+                        DPRINTF(RubySlicc, "WRITEMASK:%s\n", in_msg.writeMask);
+                        if (/* TODO: use_seq_not_coal */ true) {
+                            triggerLine(Event:ReqO, in_msg.LineAddress, cache_entry, tbe, in_msg.writeMask);
+                        } else {
+                            triggerLine(Event:ReqWT, in_msg.LineAddress, cache_entry, tbe, in_msg.writeMask);
+                        }
+                    } else {
+                        Addr victim := L1cache.cacheProbe(in_msg.LineAddress);
+                        /* NOTE cannot mix traditional triggers with triggerLines
+                         * so we need to create a full WriteMask to dictate the Repl
+                         * event must be called on the complete line */
+                        WriteMask fullLine;
+                        fullLine.fillMask();
+                        DPRINTF(RubySlicc, "Full cache, kicking victim 0x%x for 0x%x\n", victim, in_msg.LineAddress);
+                        triggerLine(Event:Repl_man, victim, getCacheEntry(victim), TBEs.lookup(victim), fullLine);
+                    }
+
+                } else if (in_msg.Type == RubyRequestType:IFETCH) {
+                    triggerLine(Event:Fetch, in_msg.LineAddress, cache_entry, tbe, in_msg.writeMask);
+                } else if (in_msg.Type == RubyRequestType:REPLACEMENT) {
+                    triggerLine(Event:Evict, in_msg.LineAddress, cache_entry, tbe, in_msg.writeMask);
+
+
+                //// denovo write requests ////
+                //   See RubySlicc_Exports.sm for a description of the mnemonic
+                } else if (in_msg.Type == RubyRequestType:ST_LGO) {
+                    DPRINTF(RubyDeNovoRegion, "ST_LGO: %s\n", in_msg);
+                    // based on RubyRequestType:ST
+                    if ( is_valid(cache_entry) || L1cache.cacheAvail(in_msg.LineAddress) ) {
+                        WriteMask fullLine;
+                        fullLine.fillMask();
+                        triggerLine(Event:ReqOData, in_msg.LineAddress, cache_entry, tbe, fullLine);
+                    } else {
+                        Addr victim := L1cache.cacheProbe(in_msg.LineAddress);
+                        /* NOTE cannot mix traditional triggers with triggerLines
+                         * so we need to create a full WriteMask to dictate the Repl
+                         * event must be called on the complete line */
+                        WriteMask fullLine;
+                        fullLine.fillMask();
+                        DPRINTF(RubySlicc, "Full cache, kicking victim 0x%x for 0x%x\n", victim, in_msg.LineAddress);
+                        triggerLine(Event:Repl_man, victim, getCacheEntry(victim), TBEs.lookup(victim), fullLine);
+                    }
+                } else if (in_msg.Type == RubyRequestType:ST_WT) {
+                    DPRINTF(RubyDeNovoRegion, "ST_WT: %s\n", in_msg);
+                    // based on RubyRequestType:ST
+                    if ( is_valid(cache_entry) || L1cache.cacheAvail(in_msg.LineAddress) ) {
+                        triggerLine(Event:ReqWT, in_msg.LineAddress, cache_entry, tbe, in_msg.writeMask);
+                    } else {
+                        Addr victim := L1cache.cacheProbe(in_msg.LineAddress);
+                        /* NOTE cannot mix traditional triggers with triggerLines
+                         * so we need to create a full WriteMask to dictate the Repl
+                         * event must be called on the complete line */
+                        WriteMask fullLine;
+                        fullLine.fillMask();
+                        DPRINTF(RubySlicc, "Full cache, kicking victim 0x%x for 0x%x\n", victim, in_msg.LineAddress);
+                        triggerLine(Event:Repl_man, victim, getCacheEntry(victim), TBEs.lookup(victim), fullLine);
+                    }
+>>>>>>> 1129451065 (Spandex debugging)
+
+                /* //// denovo read requests //// */
+                /* } else if (in_msg.Type == RubyRequestType:LD_LG) { */
+                /*     // based on RubyRequestType:LD */
+                /*     DPRINTF(RubyDeNovoRegion, "LD_LG: %s\n", in_msg); */
+                /*     // NOTE we don't need to worry about Repl until the rspV */
+                /*     WriteMask fullLine; */
+                /*     fullLine.fillMask(); */
+                /*     triggerLine(Event:ReqV, in_msg.LineAddress, cache_entry, tbe, fullLine); */
+                /* } else if (in_msg.Type == RubyRequestType:LD_LGO) { */
+                /*     // based on RubyRequestType:LD */
+                /*     DPRINTF(RubyDeNovoRegion, "LD_LGO: %s\n", in_msg); */
+                /*     // NOTE we don't need to worry about Repl until the rspV */
+                /*     WriteMask fullLine; */
+                /*     fullLine.fillMask(); */
+                /*     triggerLine(Event:ReqOData, in_msg.LineAddress, cache_entry, tbe, fullLine); */
+                /* } else if (in_msg.Type == RubyRequestType:LD_SLGO) { */
+                /*     // NOTE we don't need to worry about Repl until the rspV */
+                /*     DPRINTF(RubyDeNovoRegion, "LD_SLGO: %s\n", in_msg); */
+                /*     // NOTE we don't need to worry about Repl until the rspV */
+                /*     WriteMask fullLine; */
+                /*     fullLine.fillMask(); */
+                /*     triggerLine(Event:ReqS, in_msg.LineAddress, cache_entry, tbe, fullLine); */
+                } else {
+                    error("Unsupported manQueue request type\n");
+
+                }
+            }
+        }
+    }
+
+    /***************************OUT PORT***************************************/
+    out_port(requestNetwork_out,    RequestMsg,     requestFromL1Cache);
+    out_port(responseNetwork_out,   ResponseMsg,    responseFromL1Cache);
+    out_port(peerRequestNetwork_out,    RequestMsg,     peerRequestFromL1Cache);
+    out_port(peerResponseNetwork_out,   ResponseMsg,    peerResponseFromL1Cache);
+
+    /***************************ACTIONS****************************************/
+    action(a_allocate, "a", desc="allocate block") {
+        if (is_invalid(cache_entry)) {
+            Addr lineAddr := makeLineAddress(address);
+            set_cache_entry(L1cache.allocate(lineAddr, new Entry));
+            cache_entry.writeMask.clear();
+        }
+    }
+
+    action(t_allocateTBE, "t", desc="allocate TBE Entry") {
+        Addr lineAddr := makeLineAddress(address);
+        if (action_mask.isFirstValid(address)) {
+            if (is_invalid(tbe)) {
+                check_allocate(TBEs);
+                TBEs.allocate(lineAddr);
+                set_tbe(TBEs.lookup(lineAddr));
+                DPRINTF(RubySlicc,"Alloc TBE. Addr: 0x%x\n",lineAddr);
+                if (is_valid(cache_entry)) {
+                    tbe.WordStates.cpyVec(cache_entry.WordStates);
+                }
+            }
+            tbe.BitMask.setMask(action_mask);
+        }
+    }
+
+    action(d_deallocateTBE, "d", desc="Deallocate TBE") {
+        assert(is_valid(tbe));
+        if (action_mask.isLastValid(address)) {
+            tbe.BitMask.unsetMask(action_mask);
+        }
+        if (tbe.BitMask.isEmpty()) {
+            Addr lineAddr := makeLineAddress(address);
+            TBEs.deallocate(lineAddr);
+            DPRINTF(RubySlicc, "Dealloc TBE. Addr: 0x%x\n",lineAddr);
+            unset_tbe();
+        }
+    }
+
+    action(lcp_loadCachePeer, "lcp", desc="load data from peer to cache block") {
+        if (action_mask.isFirstValid(address)) {
+            peek(peerResponseToL1Cache_in, ResponseMsg) {
+                assert(is_valid(cache_entry));
+                /* NOTE by the nature of the trigger line call, action_mask
+                 * should be the same as in_msg.bitMask */
+                cache_entry.DataBlk.copyPartial(in_msg.DataBlk, action_mask);
+                cache_entry.writeMask.orMask(action_mask);
+            }
+        }
+    }
+
+    action(lc_loadCache, "lc", desc="load data from LLC to cache block") {
+        if (action_mask.isFirstValid(address)) {
+            peek(responseToL1Cache_in, ResponseMsg) {
+                assert(is_valid(cache_entry));
+                /* NOTE by the nature of the trigger line call, action_mask
+                 * should be the same as in_msg.bitMask */
+                cache_entry.DataBlk.copyPartial(in_msg.DataBlk, action_mask);
+                cache_entry.writeMask.orMask(action_mask);
+            }
+        }
+    }
+
+    action(l_loadDone, "l", desc="local load done") {
+        assert(is_valid(cache_entry));
+        if (use_seq_not_coal) {
+            sequencer.readCallback(address, cache_entry.DataBlk, false, MachineType:L1Cache);
+        } else {
+            coalescer.readCallback(address, MachineType:L1Cache, cache_entry.DataBlk);
+        }
+    }
+
+    action(li_loadInstDone, "li", desc="local load inst done") {
+        DataBlock dataBlk;
+        sequencer.readCallback(address, dataBlk, false, MachineType:L1Cache);
+    }
+
+    action(p_popMandatoryQueue, "pm", desc="Pop Mandatory Queue") {
+        if (action_mask.isFirstValid(address)) {
+            /* NOTE peek_dangerous allows for the peeked message to be altered
+             * Use with caution and only asabsolutly required */
+            if( mandatoryQueue_in.isReady(clockEdge())) {
+                peek_dangerous(mandatoryQueue_in, RubyRequest) {
+                    in_msg.writeMask.unsetMask(action_mask);
+                    if (in_msg.writeMask.isEmpty()){
+                        mandatoryQueue_in.dequeue(clockEdge());
+                    }
+                }
+            }
+        }
+    }
+
+    action(pu_popMandatoryQueueUnconditional, "pu", desc="Pop Mandatory Queue Unconditionally") {
+        if (action_mask.isFirstValid(address)) {
+            /* NOTE peek_dangerous allows for the peeked message to be altered
+             * Use with caution and only asabsolutly required */
+            if( mandatoryQueue_in.isReady(clockEdge())) {
+                DPRINTF(RubySlicc, "pu_popMandatoryQueueUnconditional addr:0x%x msgmask:%s actionmask:%s\n", address, action_mask);
+                mandatoryQueue_in.dequeue(clockEdge());
+            }
+        }
+    }
+
+    action(prs_popResponseQueue, "prs", desc="Pop Response Queue") {
+        if (action_mask.isFirstValid(address)) {
+            /* NOTE peek_dangerous allows for the peeked message to be altered
+             * Use with caution and only asabsolutly required */
+            peek_dangerous(responseToL1Cache_in, ResponseMsg) {
+                in_msg.bitMask.unsetMask(action_mask);
+                if (in_msg.bitMask.isEmpty()){
+                    responseToL1Cache_in.dequeue(clockEdge());
+                }
+            }
+        }
+    }
+
+    action(prsu_popResponseQueueUnconditional, "prsu", desc="Pop Response Queue") {
+        if (action_mask.isFirstValid(address)) {
+            responseToL1Cache_in.dequeue(clockEdge());
+        }
+    }
+
+    action(prq_popRequestQueue, "prq", desc="Pop Request Queue") {
+        if (action_mask.isFirstValid(address)) {
+            /* NOTE peek_dangerous allows for the peeked message to be altered
+             * Use with caution and only asabsolutly required */
+            peek_dangerous(requestToL1Cache_in, RequestMsg) {
+                in_msg.bitMask.unsetMask(action_mask);
+                if (in_msg.bitMask.isEmpty()){
+                    requestToL1Cache_in.dequeue(clockEdge());
+                }
+            }
+        }
+    }
+
+    action(pprq_popPeerRequestQueue, "pprq", desc="Pop PeerRequest Queue") {
+        if (action_mask.isFirstValid(address)) {
+            /* NOTE peek_dangerous allows for the peeked message to be altered
+             * Use with caution and only asabsolutly required */
+            peek_dangerous(peerRequestToL1Cache_in, RequestMsg) {
+                in_msg.bitMask.unsetMask(action_mask);
+                if (in_msg.bitMask.isEmpty()){
+                    peerRequestToL1Cache_in.dequeue(clockEdge());
+                }
+            }
+        }
+    }
+
+    action(pprs_popPeerResponseQueue, "pprs", desc="Pop PeerResponse Queue") {
+        if (action_mask.isFirstValid(address)) {
+            /* NOTE peek_dangerous allows for the peeked message to be altered
+             * Use with caution and only asabsolutly required */
+            peek_dangerous(peerResponseToL1Cache_in, ResponseMsg) {
+                in_msg.bitMask.unsetMask(action_mask);
+                if (in_msg.bitMask.isEmpty()){
+                    peerResponseToL1Cache_in.dequeue(clockEdge());
+                }
+            }
+        }
+    }
+
+    action(pprsu_popPeerResponseQueueUnconditional, "pprsu", desc="Pop PeerResponse Queue Unconditionally") {
+        if (action_mask.isFirstValid(address)) {
+            peerResponseToL1Cache_in.dequeue(clockEdge());
+        }
+    }
+
+    action(irv_issueReqV, "irv", desc="Issue ReqV") {
+        if (action_mask.isFirstValid(address)) {
+            DPRINTF(RubySlicc, "%s\n", action_mask);
+            peek(mandatoryQueue_in, RubyRequest) {
+                enqueue(requestNetwork_out, RequestMsg, issue_latency) {
+                    out_msg.LineAddress := in_msg.LineAddress;
+                    out_msg.Type := CoherenceRequestType:ReqV;
+                    out_msg.Requestor := machineID;
+                    out_msg.Destination.add(mapAddressToMachine(address, MachineType:L2Cache));
+                    out_msg.MessageSize := MessageSizeType:Request_Control;
+                    out_msg.bitMask.cpyMask(action_mask);
+                    out_msg.ReqIssue := curCycle();
+                    DPRINTF(RubySlicc, "%s\n", out_msg);
+                }
+            }
+        }
+    }
+
+    action(irvr_issueReqVRetry, "irvr", desc="Issue ReqV after nack") {
+        if (action_mask.isFirstValid(address)) {
+            peek(peerResponseToL1Cache_in, ResponseMsg) {
+                enqueue(requestNetwork_out, RequestMsg, issue_latency) {
+                    out_msg.LineAddress := in_msg.LineAddress;
+                    out_msg.Type := CoherenceRequestType:ReqV;
+                    out_msg.Requestor := machineID;
+                    out_msg.Destination.add(mapAddressToMachine(address, MachineType:L2Cache));
+                    out_msg.MessageSize := MessageSizeType:Request_Control;
+                    out_msg.bitMask.cpyMask(action_mask);
+                    out_msg.ReqIssue := curCycle();
+                }
+            }
+        }
+    }
+
+    action(irs_issueReqS, "irs", desc="Issue ReqS") {
+        if (action_mask.isFirstValid(address)) {
+            peek(mandatoryQueue_in, RubyRequest) {
+                enqueue(requestNetwork_out, RequestMsg, issue_latency) {
+                    out_msg.LineAddress := in_msg.LineAddress;
+                    out_msg.Type := CoherenceRequestType:ReqS;
+                    out_msg.Requestor := machineID;
+                    out_msg.Destination.add(mapAddressToMachine(address, MachineType:L2Cache));
+                    out_msg.MessageSize := MessageSizeType:Request_Control;
+                    out_msg.bitMask.cpyMask(action_mask);
+                    out_msg.ReqIssue := curCycle();
+                }
+            }
+        }
+    }
+
+    action(iro_issueReqO, "iro", desc="Issue ReqO") {
+        if (action_mask.isFirstValid(address)) {
+            peek(mandatoryQueue_in, RubyRequest) {
+                enqueue(requestNetwork_out, RequestMsg, issue_latency) {
+                    out_msg.LineAddress := in_msg.LineAddress;
+                    out_msg.Type := CoherenceRequestType:ReqO;
+                    out_msg.Requestor := machineID;
+                    out_msg.Destination.add(mapAddressToMachine(address, MachineType:L2Cache));
+                    out_msg.MessageSize := MessageSizeType:Request_Control;
+                    out_msg.bitMask.cpyMask(action_mask);
+                    out_msg.ReqIssue := curCycle();
+                }
+            }
+        }
+    }
+
+    action(srv_sendRspV, "srv", desc="Send RspV") {
+        if (action_mask.isFirstValid(address)) {
+            peek(requestToL1Cache_in, RequestMsg) {
+                enqueue(peerResponseNetwork_out, ResponseMsg, issue_latency) {
+                    out_msg.LineAddress := in_msg.LineAddress;
+                    out_msg.Type := CoherenceResponseType:RspV;
+                    out_msg.Sender:= machineID;
+                    out_msg.Destination.add(in_msg.Requestor);
+                    //TODO Again, this isn't a super accurate message size
+                    out_msg.MessageSize := MessageSizeType:Response_Data;
+                    out_msg.bitMask.cpyMask(action_mask);
+                    out_msg.DataBlk.copyPartial(cache_entry.DataBlk, action_mask);
+                    out_msg.ReqIssue := curCycle();
+                }
+            }
+        }
+    }
+
+
+    action(sro_sendRspO, "sro", desc="Send RspO") {
+        if (action_mask.isFirstValid(address)) {
+            peek(requestToL1Cache_in, RequestMsg) {
+                enqueue(peerResponseNetwork_out, ResponseMsg, issue_latency) {
+                    out_msg.LineAddress := in_msg.LineAddress;
+                    out_msg.Type := CoherenceResponseType:RspO;
+                    out_msg.Sender:= machineID;
+                    out_msg.Destination.add(in_msg.Requestor);
+                    out_msg.MessageSize := MessageSizeType:Response_Control;
+
+                    // Note: we respond with the intersection of our state and the request
+                    // for RspO, otherwise we must send data
+                    out_msg.bitMask.cpyMask(action_mask);
+                    out_msg.bitMask.andMask(in_msg.bitMask);
+
+                    out_msg.ReqIssue := curCycle();
+                }
+            }
+        }
+    }
+
+    action(srod_sendRspOData, "srod", desc="Send RspOData") {
+        if (action_mask.isFirstValid(address)) {
+            peek(peerRequestToL1Cache_in, RequestMsg) {
+                enqueue(peerResponseNetwork_out, ResponseMsg, issue_latency) {
+                    out_msg.LineAddress := in_msg.LineAddress;
+                    out_msg.Type := CoherenceResponseType:RspOdata;
+                    out_msg.Sender:= machineID;
+                    out_msg.Destination.add(in_msg.Requestor);
+                    out_msg.MessageSize := MessageSizeType:Response_Data;
+                    out_msg.bitMask.cpyMask(action_mask);
+                    out_msg.DataBlk.copyPartial(cache_entry.DataBlk, action_mask);
+                    out_msg.ReqIssue := curCycle();
+                }
+            }
+        }
+    }
+
+    action(snrv_sendNackReqV, "snrv", desc="Nack a fwdReqV"){
+        if (action_mask.isFirstValid(address)) {
+            peek(requestToL1Cache_in, RequestMsg) {
+                enqueue(peerResponseNetwork_out, ResponseMsg, issue_latency) {
+                        out_msg.LineAddress := in_msg.LineAddress;
+                        out_msg.Type := CoherenceResponseType:NackReqV;
+                        out_msg.Sender := machineID;
+                        out_msg.Destination.add(in_msg.Requestor);
+                        out_msg.MessageSize := MessageSizeType:Response_Control;
+                        out_msg.bitMask.cpyMask(action_mask);
+                        out_msg.ReqIssue := curCycle();
+                }
+            }
+        }
+    }
+
+    action(irod_issueReqOData, "irod", desc="Issue ReqO+Data") {
+        if (action_mask.isFirstValid(address)) {
+            peek(mandatoryQueue_in, RubyRequest) {
+                enqueue(requestNetwork_out, RequestMsg, issue_latency) {
+                    out_msg.LineAddress := in_msg.LineAddress;
+                    out_msg.Type := CoherenceRequestType:ReqOData;
+                    out_msg.Requestor := machineID;
+                    out_msg.Destination.add(mapAddressToMachine(address, MachineType:L2Cache));
+                    out_msg.MessageSize := MessageSizeType:Request_Control;
+                    out_msg.bitMask.cpyMask(action_mask);
+                    out_msg.ReqIssue := curCycle();
+                }
+            }
+        }
+    }
+
+    action(s_storeData, "sd", desc="copy appropriate data to the cache entry") {
+        assert(is_valid(cache_entry));
+        if (action_mask.isFirstValid(address)) {
+            peek(mandatoryQueue_in, RubyRequest) {
+                cache_entry.DataBlk.copyPartial(in_msg.WTData, action_mask);
+                cache_entry.writeMask.orMask(action_mask);
+                cache_entry.Dirty := true;
+            }
+        }
+    }
+
+    action(s_storeDone, "s", desc="local store done") {
+        assert(is_valid(cache_entry));
+        /* NOTE this calls writeCallback for every word, coalesced in the coalescer */
+        if (use_seq_not_coal) {
+            sequencer.writeCallback(address, cache_entry.DataBlk, false, MachineType:L1Cache);
+        } else {
+            coalescer.writeCallback(address, MachineType:L1Cache, cache_entry.DataBlk);
+        }
+    }
+
+    //TODO Update storeDoneComplete to be used for Rsp's
+    //I.E. not using the mandQ
+    action(s_storeDoneComplete, "sc", desc="local store done complete") {
+        assert(is_valid(cache_entry));
+        if (action_mask.isFirstValid(address)) {
+            peek(mandatoryQueue_in, RubyRequest) {
+                if (use_seq_not_coal) {
+                     DPRINTF(RubySlicc, "Sequencer does not define writeCompleteCallback\n");
+                } else {
+                    /* TODO If the action_mask is split then this will have an issue with instSeqNum
+                     * We coalesce writeCallback at the coalescer, I could do the same with this
+                     * if we I want to add another WriteMask to the request.  Doesn't seem like
+                     * the most unreasonable thing. */
+                    DPRINTF(WHD, "GPU store done complete: 0x%x, %s\n", address, action_mask);
+                    coalescer.writeCompleteCallback(in_msg.LineAddress, in_msg.instSeqNum, MachineType:L1Cache);
+                }
+            }
+        }
+    }
+
+    action(a_ack, "ack", desc="Acknowledge invalidate request") {
+        if (action_mask.isFirstValid(address)) {
+            peek(requestToL1Cache_in, RequestMsg) {
+                enqueue(responseNetwork_out, ResponseMsg, issue_latency) {
+                    out_msg.LineAddress := in_msg.LineAddress;
+                    out_msg.Type := CoherenceResponseType:Ack;
+                    out_msg.Sender := machineID;
+                    out_msg.Destination.add(in_msg.Requestor);
+                    out_msg.MessageSize := MessageSizeType:Response_Control;
+                    out_msg.bitMask.cpyMask(action_mask);
+                    out_msg.RspIssue := curCycle();
+                }
+            }
+        }
+    }
+
+    action(sais_sendAckInvS, "sais", desc="Acknowledge invalidate shared request") {
+        if (action_mask.isFirstValid(address)) {
+            peek(requestToL1Cache_in, RequestMsg) {
+                enqueue(responseNetwork_out, ResponseMsg, issue_latency) {
+                    out_msg.LineAddress := in_msg.LineAddress;
+                    out_msg.Type := CoherenceResponseType:AckInvS;
+                    out_msg.Sender := machineID;
+                    out_msg.Destination.add(in_msg.Requestor);
+                    out_msg.MessageSize := MessageSizeType:Response_Control;
+                    out_msg.bitMask.cpyMask(action_mask);
+                    out_msg.RspIssue := curCycle();
+                }
+            }
+        }
+    }
+
+    action(inv_invDone, "inv", desc="local inv done") {
+        if (action_mask.isFirstValid(address)) {
+            peek_dangerous(mandatoryQueue_in, RubyRequest) {
+                in_msg.writeMask.unsetMask(action_mask);
+                if (in_msg.writeMask.isEmpty()) {
+                    if (use_seq_not_coal) {
+                        DPRINTF(RubySlicc, "Sequencer does not define invCallback!\n");
+                        assert(false);
+                    } else {
+                        coalescer.invTCPCallback(in_msg.LineAddress);
+                    }
+                }
+            }
+        }
+    }
+
+    action(ic_invCache, "ic", desc="invalidate cache line") {
+        DPRINTF(RubySlicc, "ic_invCache(addr=0x%x mask=%s)\n", address, action_mask);
+        if (action_mask.isLastValid(address)) {
+            if (is_valid(cache_entry)
+                  && cache_entry.WordStates.containsOnly(State:I)
+                  && action_mask.cmpMask(cache_entry.writeMask)) {
+                cache_entry.writeMask.clear();
+                L1cache.deallocate(makeLineAddress(address));
+                unset_cache_entry();
+                DPRINTF(RubySlicc, "unset cache entry\n");
+            }
+        }
+    }
+
+    action(z_stall, "z", desc="stall; built-in") {
+        // built-in action
+    }
+
+    action(z0_stallAndWaitManQ, "z0", desc="Recycle mand. queue request") {
+        if(action_mask.isFirstValid(address)) {
+            DPRINTF(RubySlicc, "Recycling req for 0x%x\n", address);
+
+            WriteMask stall_mask;
+            peek(mandatoryQueue_in, RubyRequest) {
+                stall_mask.cpyMask(action_mask);
+                stall_mask.andMask(in_msg.writeMask);
+            }
+            stall_and_wait_partial(mandatoryQueue_in, address, stall_mask);
+        }
+    }
+
+    action(z1_stallAndWaitRsp, "z1", desc="Recycle l2 rsp to l1") {
+        if(action_mask.isFirstValid(address)) {
+            DPRINTF(RubySlicc, "Recycling rsp for 0x%x\n", address);
+            WriteMask stall_mask;
+            peek(responseToL1Cache_in, ResponseMsg) {
+                stall_mask.cpyMask(action_mask);
+                stall_mask.andMask(in_msg.bitMask);
+            }
+            DPRINTF(RubySlicc, "Stall mask: %s\n", stall_mask);
+            stall_and_wait_partial(responseToL1Cache_in, address, stall_mask);
+        }
+    }
+
+    action(z2_stallAndWaitPeerRsp, "z2", desc="Recycle peer rsp to l1") {
+        if(action_mask.isFirstValid(address)) {
+            DPRINTF(RubySlicc, "Recycling prsp for 0x%x\n", address);
+            WriteMask stall_mask;
+            peek(peerResponseToL1Cache_in, ResponseMsg) {
+                stall_mask.cpyMask(action_mask);
+                stall_mask.andMask(in_msg.bitMask);
+            }
+            stall_and_wait_partial(peerResponseToL1Cache_in, address, stall_mask);
+        }
+    }
+
+    action(wb_wakeUpDependents, "wb", desc="Wake-up all dependents") {
+        if (action_mask.isFirstValid(address)) {
+            DPRINTF(RubySlicc, "WakeUp all Buffers: [0x%x, line 0x%x]\n",address,makeLineAddress(address));
+            wakeUpAllBuffers(makeLineAddress(address));
+        }
+    }
+
+    action(irwb_issueReqWB, "irwb", desc="Issue req writeback") {
+        if(action_mask.isFirstValid(address)) {
+           enqueue(requestNetwork_out, RequestMsg, issue_latency) {
+               out_msg.LineAddress := makeLineAddress(address);
+               out_msg.Type := CoherenceRequestType:ReqWB_L2;
+               out_msg.Requestor := machineID;
+               out_msg.Destination.add(mapAddressToMachine(address, MachineType:L2Cache));
+               // TODO Same size issue as before
+               out_msg.MessageSize := MessageSizeType:Writeback_Data;
+               out_msg.bitMask.cpyMask(action_mask);
+               out_msg.DataBlk.copyPartial(cache_entry.DataBlk, action_mask);
+               out_msg.ReqIssue := curCycle();
+           }
+        }
+    }
+
+    action(irwt_issueReqWT, "irwt", desc="Issue req writethrough") {
+        if(action_mask.isFirstValid(address)) {
+           enqueue(requestNetwork_out, RequestMsg, issue_latency) {
+               out_msg.LineAddress := makeLineAddress(address);
+               out_msg.Type := CoherenceRequestType:ReqWT;
+               out_msg.Requestor := machineID;
+               out_msg.Destination.add(mapAddressToMachine(address, MachineType:L2Cache));
+               // TODO Same size issue as before
+               out_msg.MessageSize := MessageSizeType:Writeback_Data;
+               out_msg.bitMask.cpyMask(action_mask);
+               out_msg.DataBlk.copyPartial(cache_entry.DataBlk, action_mask);
+               out_msg.ReqIssue := curCycle();
+           }
+        }
+    }
+
+    action(ifrod_issueRspFwdOdata, "ifrod", desc="Forward data and ownership") {
+        if(action_mask.isFirstValid(address)) {
+            peek(peerRequestToL1Cache_in, RequestMsg) {
+                enqueue(peerResponseNetwork_out, ResponseMsg, issue_latency) {
+                    out_msg.LineAddress := in_msg.LineAddress;
+                    out_msg.Type := CoherenceResponseType:RspFwdOdata;
+                    out_msg.Sender := machineID;
+                    out_msg.Destination.add(in_msg.Requestor);
+                    out_msg.MessageSize := MessageSizeType:Response_Data;
+                    out_msg.bitMask.cpyMask(action_mask);
+                    out_msg.RspIssue := curCycle();
+                    out_msg.DataBlk.copyPartial(cache_entry.DataBlk, action_mask);
+                }
+            }
+        }
+    }
+
+    action(irwtd_issueReqWTData, "irwtd", desc="Issue ReqWTData") {
+        if(action_mask.isFirstValid(address)) {
+            peek(mandatoryQueue_in, RubyRequest) {
+                enqueue(requestNetwork_out, RequestMsg, issue_latency) {
+                    out_msg.LineAddress := makeLineAddress(address);
+                    out_msg.Type := CoherenceRequestType:ReqWTData;
+                    out_msg.Requestor := machineID;
+                    out_msg.Destination.add(mapAddressToMachine(address, MachineType:L2Cache));
+                    // TODO Same size issue as before
+                    out_msg.MessageSize := MessageSizeType:Writeback_Data;
+                    out_msg.bitMask.cpyMask(action_mask);
+                    out_msg.DataBlk.copyPartial(in_msg.WTData, action_mask);
+                    out_msg.ReqIssue := curCycle();
+                }
+            }
+        }
+    }
+
+    action(srs_sendRspS, "srs", desc="Send RspS") {
+        if (action_mask.isFirstValid(address)) {
+            peek(peerRequestToL1Cache_in, RequestMsg) {
+                enqueue(peerResponseNetwork_out, ResponseMsg, issue_latency) {
+                    out_msg.LineAddress := in_msg.LineAddress;
+                    out_msg.Type := CoherenceResponseType:RspS;
+                    out_msg.Sender:= machineID;
+                    out_msg.Destination.add(in_msg.Requestor);
+                    //TODO Again, this isn't a super accurate message size
+                    out_msg.MessageSize := MessageSizeType:Response_Data;
+                    out_msg.bitMask.cpyMask(action_mask);
+                    out_msg.DataBlk.copyPartial(cache_entry.DataBlk, action_mask);
+                    out_msg.ReqIssue := curCycle();
+                }
+            }
+        }
+    }
+
+    action(srvk_sendRvkO, "srvk", desc="Send RvkO") {
+        if (action_mask.isFirstValid(address)) {
+            Addr LineAddress := makeLineAddress(address);
+            enqueue(responseNetwork_out, ResponseMsg, issue_latency) {
+                out_msg.LineAddress := LineAddress;
+                out_msg.Type := CoherenceResponseType:RspRvkO;
+                out_msg.Sender:= machineID;
+                out_msg.Destination.add(mapAddressToMachine(LineAddress, MachineType:L2Cache));
+                out_msg.MessageSize := MessageSizeType:Response_Control;
+                out_msg.bitMask.cpyMask(action_mask);
+                out_msg.ReqIssue := curCycle();
+            }
+        }
+    }
+
+    action(mru_updateMRU, "mru", desc="Touch block for replacement policy") {
+        if (action_mask.isFirstValid(address)) {
+            Addr t_addr := makeLineAddress(address);
+            L1cache.setMRU(t_addr);
+        }
+    }
+
+    /***************************TRANSITIONS************************************/
+    /* TODO in VIPER they have these {TagArrayRead} annotations.  Do I want these
+     * do I need these?
+     * A: Yes, those are how we do custom stat tracking.  We can add them at the end */
+
+    /* TODO how do we do replacement/eviction selection
+     * A: this happens in the cacheProbe and is not something I need to be concerned
+     * with right now */
+
+
+    /* Process ReqV */
+    transition(I, ReqV, IV) {
+        t_allocateTBE;
+        irv_issueReqV;
+        p_popMandatoryQueue;
+    }
+
+    transition({V,S,O,WTV,IO,IOS}, ReqV) {
+        l_loadDone;
+        mru_updateMRU;
+        p_popMandatoryQueue;
+    }
+
+    /* Process ReqS */
+    transition(I, ReqS, IS) {
+        t_allocateTBE;
+        irs_issueReqS;
+        p_popMandatoryQueue;
+    }
+
+    transition({V,S,O,WTV,IO,IOS}, ReqS) {
+       l_loadDone;
+       mru_updateMRU;
+       p_popMandatoryQueue;
+    }
+
+    /* Process ReqWT */
+    /*TODO So ReqWT would only be used for a self-invalidate system, because otherwise we'd be using ReqO?
+     * Furthermore, that's why this will go to V not O right? Also, this goes to V right? we don't need to wait until the RSP? */
+    transition(I, ReqWT, WTV) {
+        a_allocate;
+        t_allocateTBE;
+        s_storeData;
+        s_storeDone;
+        irwt_issueReqWT;
+        /* NOTE s_storeDoneComplete will be done upon RspWT
+         * As for the lazy nature of the L2WT, is that okay for this GPU?
+         * The request will be considered outstanding until the complete is recieved
+         * JOHN: for now just do an actual WT, don't coalesce
+         * */
+        mru_updateMRU;
+        p_popMandatoryQueue;
+    }
+
+    transition({S,V}, ReqWT, WTV) {
+        s_storeData;
+        s_storeDone;
+        t_allocateTBE;
+        irwt_issueReqWT;
+        /* NOTE s_storeDoneComplete will be done upon RspWT
+         * As for the lazy nature of the L2WT, is that okay for this GPU?
+         * The request will be considered outstanding until the complete is recieved
+         * JOHN: for now just do an actual WT, don't coalesce
+         * */
+        mru_updateMRU;
+        p_popMandatoryQueue;
+    }
+
+    transition({O, IOS, IO}, ReqWT) {
+        s_storeData;
+        s_storeDone;
+        s_storeDoneComplete;
+        mru_updateMRU;
+        p_popMandatoryQueue;
+    }
+
+    /* Process ReqWTdata */
+    transition({I,V,S}, ReqWTData, WTI) {
+        irwtd_issueReqWTData;
+        t_allocateTBE;
+        p_popMandatoryQueue;
+    }
+
+    transition({O, IO}, ReqWTData) {
+        s_storeData;
+        s_storeDone;
+        s_storeDoneComplete;
+        mru_updateMRU;
+        p_popMandatoryQueue;
+    }
+
+    /* Process ReqO */
+    transition({I,S,V}, ReqO, IO) {
+        a_allocate;
+        t_allocateTBE;
+        iro_issueReqO;
+        s_storeData;
+        s_storeDone;
+        s_storeDoneComplete;
+        mru_updateMRU;
+        p_popMandatoryQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition({O,IO}, ReqO) {
+        s_storeData;
+        s_storeDone;
+        s_storeDoneComplete;
+        mru_updateMRU;
+        p_popMandatoryQueue;
+    }
+
+    /* Processes ReqOdata */
+    /* TODO Not sure what I'm supposed to do here.
+     * This is for an owned RMW or similar, how do I handle atomics
+     * For right now I will treat this as a write*/
+    transition(O, ReqOData) {
+        mru_updateMRU;
+        p_popMandatoryQueue;
+    }
+
+    transition({I,S,V}, ReqOData, IOdata) {
+        t_allocateTBE;
+        irod_issueReqOData;
+        p_popMandatoryQueue;
+    }
+
+    /* Process Repl */
+    transition({I,V,S}, {Repl_man, Repl_rsp, Repl_prsp}, I) {
+        ic_invCache;
+    }
+
+    transition(O, {Repl_man, Repl_rsp, Repl_prsp}, OI_1) {
+        t_allocateTBE;
+        irwb_issueReqWB;
+    }
+
+    transition({IO,OI_1,OI_2}, Repl_rsp) {
+        z1_stallAndWaitRsp;
+        prsu_popResponseQueueUnconditional;
+    }
+
+    // There can only be one stalling transition for a Repl
+    // because the unconditional pop must occur once
+    transition({IO,OI_1,OI_2}, Repl_man) {
+        z0_stallAndWaitManQ;
+        pu_popMandatoryQueueUnconditional;
+    }
+
+    transition({IO,OI_1,OI_2}, Repl_prsp) {
+        z2_stallAndWaitPeerRsp;
+        pprsu_popPeerResponseQueueUnconditional;
+    }
+
+    /* Process FwdReqV */
+    transition({O,OI_1, OI_2,IOS}, FwdReqV) {
+        srv_sendRspV;
+        prq_popRequestQueue;
+    }
+
+    transition({I,V,S,IV,IS,WTV,WTI,IOI},FwdReqV) {
+        snrv_sendNackReqV;
+        prq_popRequestQueue;
+    }
+
+    /* Process FwdReqS */
+    transition(O, FwdReqS, S) {
+        srs_sendRspS;
+        srvk_sendRvkO;
+        prq_popRequestQueue;
+    }
+
+    transition(IO, FwdReqS, IOS) {
+        srs_sendRspS;
+        srvk_sendRvkO;
+        prq_popRequestQueue;
+    }
+
+    transition(OI_1, FwdReqS, I) {
+        srs_sendRspS;
+        prq_popRequestQueue;
+        wb_wakeUpDependents;
+    }
+
+    /* Process FwdReqO */
+    transition(OI_1, FwdReqO, OI_2) {
+        sro_sendRspO;
+        prq_popRequestQueue;
+    }
+
+    transition(OI_2, FwdReqO, I) {
+        sro_sendRspO;
+        ic_invCache;
+        prq_popRequestQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition(O, FwdReqO, V) {
+        sro_sendRspO;
+        prq_popRequestQueue;
+    }
+
+    transition({IO,IOdata}, FwdReqO, IOI) {
+        sro_sendRspO;
+        prq_popRequestQueue;
+    }
+
+    /* Process FwdReqOData */
+    transition(OI_2, FwdReqOData, I) {
+        srod_sendRspOData;
+        ic_invCache;
+        prq_popRequestQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition(OI_1, FwdReqOData, OI_2) {
+        srod_sendRspOData;
+        prq_popRequestQueue;
+    }
+
+
+    transition(O, FwdReqOData, V) {
+        srod_sendRspOData;
+        ic_invCache;
+        prq_popRequestQueue;
+    }
+
+    transition(IOdata, FwdReqOData) {
+        // TODO block
+    }
+
+    /* Process RvkO */
+    transition(O, RvkO, V) {
+        srvk_sendRvkO;
+        prq_popRequestQueue;
+    }
+
+    transition(OI_1, RvkO, OI_2) {
+        srod_sendRspOData;
+        prq_popRequestQueue;
+    }
+
+    transition(OI_2, RvkO, I) {
+        srod_sendRspOData;
+        prq_popRequestQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition(IOdata, RvkO) {
+        //TODO block how ever I want to do that
+    }
+
+    /* Process Inv */
+    /* NOTE a multi-transition such as this will create mutliple action masks
+     * this means that there will be 3 acks for this transition. I do not
+     * think there is any way around this as we'd have to know that these are
+     * the same transition and that's just done via cascading switch-cases.
+     *
+     * TODO talk with john and see if this is acceptable/what we want to do.
+     * A: It's not okay, I'll need to spend some cycles fixing this, but it's
+     * disjoint from how I'll be doing things at the SLICC level
+     * Rough idea: use the stall checker to also return if states share a transition
+     *  (continuing to add complexity is such a bother though as we already see a huge
+     *  simulation performance hit)
+     *
+     * A2: I eventually followed up with john on a similar idea for handling
+     * blocks and then we decided it was okay to have multiple messages.  I'll
+     * have to think a little longer about if there's a better way to handle it
+     * than what we came up with.
+     * */
+    transition({I,S,V}, Inv, I) {
+        a_ack;
+        ic_invCache;
+        prq_popRequestQueue;
+    }
+
+    transition(O, Inv, OI_1) {
+        irwb_issueReqWB;
+        p_popMandatoryQueue;
+    }
+
+    transition({IV,IS,WTV,WTI,IO,IOdata,OI_1,OI_2,IOI,IOS}, Inv) {
+        // TODO BLOCK / recycle REQ
+    }
+
+    /* Process Nack */
+    transition(IV, NackReqV) {
+        irvr_issueReqVRetry;
+        pprs_popPeerResponseQueue;
+    }
+
+    /* Process RspV */
+    transition(I, RspV, V) {
+        a_allocate;
+        lc_loadCache;
+        mru_updateMRU;
+        prs_popResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition(I, peerRspV, V) {
+        a_allocate;
+        lcp_loadCachePeer;
+        mru_updateMRU;
+        pprs_popPeerResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition(IV, RspV, V) {
+        a_allocate;
+        lc_loadCache;
+        l_loadDone;
+        mru_updateMRU;
+        d_deallocateTBE;
+        prs_popResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition(IV, peerRspV, V) {
+        a_allocate;
+        lcp_loadCachePeer;
+        l_loadDone;
+        mru_updateMRU;
+        d_deallocateTBE;
+        pprs_popPeerResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    /* Process RspS */
+    transition(IS, RspS, S) {
+        a_allocate;
+        lc_loadCache;
+        l_loadDone;
+        mru_updateMRU;
+        d_deallocateTBE;
+        prs_popResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition(IS, peerRspS, S) {
+        a_allocate;
+        lc_loadCache;
+        l_loadDone;
+        mru_updateMRU;
+        d_deallocateTBE;
+        pprs_popPeerResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    /* Process RspO*/
+    /*******************START HOTFIX ********************/
+    //transition(O, RspO) {
+    //    d_deallocateTBE;
+    //    prs_popResponseQueue;
+    //}
+
+    //transition(O, peerRspO) {
+    //    d_deallocateTBE;
+    //    pprs_popPeerResponseQueue;
+    //}
+    /***********************END HOTFIX *****************/
+
+    transition(WTV, RspO, V) {
+        d_deallocateTBE;
+        s_storeDoneComplete;
+        prs_popResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition(WTI, RspO, I) {
+        d_deallocateTBE;
+        // TODO Maybe I don't need a storeDoneComplete
+        s_storeDoneComplete;
+        ic_invCache;
+        prs_popResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    /* NOTE/TODO I asked John and this transition could probably be an X for rn
+     * but I'm going to include it because I've included the other IO trans.
+     * */
+    transition(IO, RspO, O) {
+        d_deallocateTBE;
+        //s_storeDoneComplete;
+        //Don't store, this doesn't have data
+        prs_popResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition(IOI, RspO, I) {
+        d_deallocateTBE;
+        ic_invCache;
+        prs_popResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition(IOS, RspO, S) {
+        d_deallocateTBE;
+        prs_popResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition(WTV, peerRspO, V) {
+        d_deallocateTBE;
+        s_storeDoneComplete;
+        pprs_popPeerResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition(WTI, peerRspO, I) {
+        d_deallocateTBE;
+        // TODO Maybe I don't need a storeDoneComplete
+        s_storeDoneComplete;
+        ic_invCache;
+        pprs_popPeerResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    /* NOTE/TODO I asked John and this transition could probably be an X for rn
+     * but I'm going to include it because I've included the other IO trans.
+     * */
+    transition(IO, peerRspO, O) {
+        d_deallocateTBE;
+        //s_storeDoneComplete;
+        //Don't store, this doesn't have data
+        pprs_popPeerResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition(IOI, peerRspO, I) {
+        d_deallocateTBE;
+        ic_invCache;
+        pprs_popPeerResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition(IOS, peerRspO, S) {
+        d_deallocateTBE;
+        pprs_popPeerResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    /* Process RspOdata */
+    transition(IOdata, RspOData, O) {
+        /* NOTE V is a part of the transition into IOdata state so allocating might
+         * not be necessary, but there is a conditional in that action */
+        a_allocate;
+        lc_loadCache;
+        l_loadDone;
+        d_deallocateTBE;
+        prs_popResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition(IOI, RspOData, I) {
+        /*TODO What do I put here? Ownership has been passed to another
+         * core already.  Is this just a dead write? */
+    }
+
+    /* Process RspWB */
+    transition(OI_1, RspWB_2, I) {
+        d_deallocateTBE;
+        ic_invCache;
+        prs_popResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    transition(OI_1, RspWB_1, OI_2) {
+        d_deallocateTBE;
+        prs_popResponseQueue;
+        // NOTE basically in this state we're just waiting for
+        // the forwarded request
+    }
+
+    transition(OI_2, RspWB_1, I) {
+        d_deallocateTBE;
+        prs_popResponseQueue;
+        wb_wakeUpDependents;
+    }
+
+    /* Process InvS */
+    transition({I,V,O,IV,WTV,WTI,IO,IOdata,OI_1,OI_2,IOI}, InvS) {
+        sais_sendAckInvS;
+        prq_popRequestQueue;
+    }
+
+    transition(S, InvS, I) {
+        sais_sendAckInvS;
+        prq_popRequestQueue;
+    }
+
+    transition(IOS, InvS, IOI) {
+        sais_sendAckInvS;
+        prq_popRequestQueue;
+    }
+
+    transition(IS, InvS) {
+        //TODO block
+    }
+
+    /* Process SelfInv */
+    transition({I,S,O,IS,WTI,IO,IOdata,OI_1,OI_2,IOI,IOS}, SelfInv) {
+        // These reqs are ignored
+        p_popMandatoryQueue;
+    }
+
+    transition(V, SelfInv, I) {
+        p_popMandatoryQueue;
+    }
+
+    // TODO What should be the transient state here?
+    //transition(IV, SelfInv, /*??*/) {
+    //    p_popMandatoryQueue;
+    //}
+
+    transition(WTV, SelfInv, WTI) {
+        p_popMandatoryQueue;
+    }
+
+    /* Process Evict (GPU custom) */
+    transition(O, Evict, OI_1) {
+        /* NOTE So rn I'm converging the paths of O+Evict and O+Repl and O+Inv
+         * This is not correct because inv_invDone needs to be called.
+         * Actually, as I think about this I wonder how the kernel invalidates are being done
+         * i.e. is it controlled by the hardware or is there a sweep of evicts called at the start
+         * of a kernel launch.  TODO Ask John this and then we need to figure out how we want to handle
+         * this for a case like DeNovo for GPU. (Where we don't want to evict owned)
+         * */
+        irwb_issueReqWB;
+        p_popMandatoryQueue;
+    }
+
+    transition({V,I}, Evict, I) {
+        inv_invDone;
+        ic_invCache;
+        p_popMandatoryQueue;
+    }
+
+    /********************************* ICACHE ********************************/
+    // NOTE: sometimes instruction addresses get brought into the cache as data
+    // which means we need to support a V,Fetch
+    transition({I,V}, Fetch) {
+        //a_allocate;
+        li_loadInstDone;
+        //ic_invCache;
+        p_popMandatoryQueue;
+    }
+}

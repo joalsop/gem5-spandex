@@ -95,6 +95,7 @@ void workend(ThreadContext *tc, uint64_t workid, uint64_t threadid);
 void m5Syscall(ThreadContext *tc);
 void togglesync(ThreadContext *tc);
 void triggerWorkloadEvent(ThreadContext *tc);
+void denovo_region_set(ThreadContext *tc, uint64_t rdi, uint64_t rsi);
 
 /**
  * Execute a decoded M5 pseudo instruction

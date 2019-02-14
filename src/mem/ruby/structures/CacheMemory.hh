@@ -159,7 +159,7 @@ class CacheMemory : public SimObject
     int getNumBlocks() const { return m_cache_num_sets * m_cache_assoc; }
     Addr getAddressAtIdx(int idx) const;
 
-  private:
+  protected:
     // convert a Address to its location in the cache
     int64_t addressToCacheSet(Addr address) const;
 
@@ -172,7 +172,7 @@ class CacheMemory : public SimObject
     CacheMemory(const CacheMemory& obj);
     CacheMemory& operator=(const CacheMemory& obj);
 
-  private:
+  protected:
     // Data Members (m_prefix)
     bool m_is_instruction_only_cache;
 

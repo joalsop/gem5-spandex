@@ -55,6 +55,8 @@ external_type(RequestPtr, primitive="yes", default="nullptr");
 structure(WriteMask, external="yes", desc="...") {
   void clear();
   bool containsMask(WriteMask);
+  bool cmpMask(WriteMask);
+  void cpyMask(WriteMask);
   bool isEmpty();
   bool isFull();
   bool isOverlap(WriteMask);
@@ -62,14 +64,22 @@ structure(WriteMask, external="yes", desc="...") {
   void orMask(WriteMask);
   void setInvertedMask(WriteMask);
   void fillMask();
-  void setMask(int,int);
-  bool getMask(int,int);
-  void setMask(int,int,bool);
   int firstBitSet(bool);
   int firstBitSet(bool,int);
   int count();
   int count(int);
   bool test(int);
+  int getWordOffset(Addr);
+  int getByteOffset(Addr);
+  int getSize();
+  int getCount();
+  void setMask(int, int);
+  void unsetMask(int, int);
+  void setMask(WriteMask);
+  void unsetMask(WriteMask);
+  bool isFirstValid(Addr);
+  bool isLastValid(Addr);
+  void invertMask();
 }
 
 structure(DataBlock, external = "yes", desc="..."){
@@ -78,6 +88,7 @@ structure(DataBlock, external = "yes", desc="..."){
   void copyPartial(DataBlock, WriteMask);
   void atomicPartial(DataBlock, WriteMask);
 }
+
 
 bool testAndRead(Addr addr, DataBlock datablk, Packet *pkt);
 bool testAndReadMask(Addr addr, DataBlock datablk, WriteMask mask, Packet *pkt);
@@ -179,6 +190,7 @@ enumeration(RubyRequestType, desc="...", default="RubyRequestType_NULL") {
   Release,           desc="Release operation";
   Acquire,           desc="Acquire opertion";
   AcquireRelease,    desc="Acquire and Release opertion";
+<<<<<<< HEAD:src/mem/ruby/protocol/RubySlicc_Exports.sm
   HTM_Start,         desc="hardware memory transaction: begin";
   HTM_Commit,        desc="hardware memory transaction: commit";
   HTM_Cancel,        desc="hardware memory transaction: cancel";
@@ -204,6 +216,13 @@ enumeration(HtmFailedInCacheReason, desc="...", default="HtmFailedInCacheReason_
   FAIL_SELF,        desc="failed due local cache's replacement policy";
   FAIL_REMOTE,      desc="failed due remote invalidation";
   FAIL_OTHER,       desc="failed due other circumstances";
+=======
+  ST_WT,             desc="Write-through store";
+  ST_LGO,            desc="Line-granularity owned store";
+  LD_LG,             desc="Line-granularity load";
+  LD_LGO,            desc="Line-granularity owned load";
+  LD_SLGO,           desc="Shared line-granularity load";
+>>>>>>> e9628e7528 (Added spandex-msg file):src/mem/protocol/RubySlicc_Exports.sm
 }
 
 enumeration(SequencerRequestType, desc="...", default="SequencerRequestType_NULL") {
@@ -247,6 +266,7 @@ enumeration(MemoryControlRequestType, desc="...", default="MemoryControlRequestT
 // you cannot use anything other than the ones defined here.  Also, a protocol
 // can have only one state machine for a given type.
 enumeration(MachineType, desc="...", default="MachineType_NULL") {
+    ICache,      desc="I Cache Mach";
     L0Cache,     desc="L0 Cache Mach";
     L1Cache,     desc="L1 Cache Mach";
     L2Cache,     desc="L2 Cache Mach";
